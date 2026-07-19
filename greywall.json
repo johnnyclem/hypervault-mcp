@@ -1,0 +1,9 @@
+{
+  "extends": "code",
+  "filesystem": {
+    "allowWrite": ["."]
+  },
+  "credentials": {
+    "secrets": ["HYPERVAULT_API_KEY"]
+  }
+}
