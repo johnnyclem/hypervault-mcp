@@ -5,6 +5,10 @@ MCP-capable agent save artifacts to a user's vault and claim vanity subdomains.
 
 Built with [FastMCP](https://gofastmcp.com).
 
+**Hosted endpoint:** `https://mcp.vault.cool/mcp` (Streamable HTTP) — no
+install needed, just point your MCP client at it with your own API key. See
+[Auth & rate limits](#auth--rate-limits) for the header format.
+
 ## Install & run
 
 ```bash
@@ -127,12 +131,16 @@ How the key gets there depends on the transport:
   {
     "mcpServers": {
       "hypervault": {
-        "url": "https://hypervault-mcp.vercel.app/mcp",
+        "url": "https://mcp.vault.cool/mcp",
         "headers": { "Authorization": "Bearer hv_your_key_here" }
       }
     }
   }
   ```
+
+  `https://mcp.vault.cool/mcp` is a custom-domain alias for the same
+  deployment as `https://hypervault-mcp.vercel.app/mcp` — the two are
+  interchangeable and always serve identical code.
 
 ## Tests
 

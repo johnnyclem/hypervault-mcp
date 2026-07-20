@@ -7,8 +7,9 @@ Authentication differs by transport:
 
 * STDIO (local agents) — a single trusted local user. The key comes from the
   HYPERVAULT_API_KEY environment variable, set once when the process starts.
-* HTTP (the hosted Vercel deployment, shared by many callers) — every call
-  must carry the *caller's own* key, sent per-request as either
+* HTTP (the hosted deployment at https://mcp.vault.cool/mcp — a custom-domain
+  alias for https://hypervault-mcp.vercel.app/mcp, shared by many callers) —
+  every call must carry the *caller's own* key, sent per-request as either
   ``Authorization: Bearer hv_...`` or ``X-HyperVault-Key: hv_...``. There is
   no server-side fallback key for HTTP: an operator-configured
   HYPERVAULT_API_KEY environment variable, if set at all, is never used to
