@@ -3,8 +3,22 @@
 Lets any MCP-capable agent save artifacts straight into a user's HyperVault
 and claim vanity subdomains, by calling the same backend the web app uses.
 
+Authentication differs by transport:
+
+* STDIO (local agents) — a single trusted local user. The key comes from the
+  HYPERVAULT_API_KEY environment variable, set once when the process starts.
+* HTTP (the hosted Vercel deployment, shared by many callers) — every call
+  must carry the *caller's own* key, sent per-request as either
+  ``Authorization: Bearer hv_...`` or ``X-HyperVault-Key: hv_...``. There is
+  no server-side fallback key for HTTP: an operator-configured
+  HYPERVAULT_API_KEY environment variable, if set at all, is never used to
+  answer someone else's request. The key is forwarded as-is to the real
+  HyperVault backend (hypervault.store), which is the only place that ever
+  looks it up (it stores just a salted SHA-256 hash) — this server never
+  persists, logs, or validates keys itself.
+
 Configuration (environment variables):
-    HYPERVAULT_API_KEY   required — created in the web dashboard (/vault)
+    HYPERVAULT_API_KEY   STDIO only — created in the web dashboard (/vault)
     HYPERVAULT_API_URL   optional — defaults to https://hypervault.store
 
 Run over STDIO (local agents):
@@ -24,6 +38,7 @@ from typing import Any
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers, get_http_request
 
 DEFAULT_API_URL = "https://hypervault.store"
 API_KEY_HEADER = "X-HyperVault-Key"
@@ -54,7 +69,53 @@ class HyperVaultError(Exception):
     """Raised with a human-readable message when the backend rejects a call."""
 
 
-def _client() -> httpx.Client:
+def _extract_bearer_key(headers: dict[str, str]) -> str | None:
+    """Pull an API key out of a lowercased header dict.
+
+    Accepts ``X-HyperVault-Key`` directly, or a standard
+    ``Authorization: Bearer <key>`` header (case-insensitive scheme).
+    """
+    direct = (headers.get(API_KEY_HEADER.lower()) or "").strip()
+    if direct:
+        return direct
+    auth = (headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        token = auth[len("bearer ") :].strip()
+        if token:
+            return token
+    return None
+
+
+def _in_http_request_context() -> bool:
+    """True when running inside an active HTTP request (Streamable HTTP
+    transport), as opposed to a local STDIO session."""
+    try:
+        get_http_request()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _resolve_api_key() -> str:
+    """Resolve the API key to use for the current call.
+
+    Over HTTP, the key must come from the incoming request itself — every
+    caller authenticates with their own key, and there is no shared
+    server-side fallback. Over STDIO, the key comes from the
+    HYPERVAULT_API_KEY environment variable, set once for the local process.
+    """
+    if _in_http_request_context():
+        headers = get_http_headers(include_all=True)
+        api_key = _extract_bearer_key(headers)
+        if not api_key:
+            raise HyperVaultError(
+                "Authentication required. Pass your HyperVault API key "
+                f"(create one in the web dashboard's Vault → Agent API keys) "
+                f"as either '{API_KEY_HEADER}: hv_...' or "
+                "'Authorization: Bearer hv_...' on every request."
+            )
+        return api_key
+
     api_key = os.environ.get("HYPERVAULT_API_KEY", "").strip()
     if not api_key:
         raise HyperVaultError(
@@ -62,6 +123,11 @@ def _client() -> httpx.Client:
             "dashboard (Vault → Agent API keys) and export it before starting "
             "the server."
         )
+    return api_key
+
+
+def _client() -> httpx.Client:
+    api_key = _resolve_api_key()
     base_url = os.environ.get("HYPERVAULT_API_URL", DEFAULT_API_URL).rstrip("/")
     return httpx.Client(
         base_url=base_url,
@@ -88,8 +154,8 @@ def _request(
         payload = {}
 
     if response.status_code >= 400:
-        message = payload.get("error") or f"HyperVault returned HTTP {response.status_code}."
-        raise HyperVaultError(message)
+        error = payload.get("error") if isinstance(payload, dict) else None
+        raise HyperVaultError(error or f"HyperVault returned HTTP {response.status_code}.")
     return payload
 
 
