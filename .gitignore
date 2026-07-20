@@ -149,3 +149,6 @@ __pycache__/
 .env*
 !.env.example
 .DS_Store
+.venv/
+.coverage
+.pytest_cache/

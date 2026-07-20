@@ -17,6 +17,8 @@ hypervault-mcp                                # STDIO (local agents)
 hypervault-mcp --transport http --port 8787   # HTTP (web agents)
 ```
 
+Authentication differs by transport — see [Auth & rate limits](#auth--rate-limits) below.
+
 ## Tools
 
 | Tool | What it does |
@@ -96,9 +98,56 @@ a placeholder — greyproxy substitutes the real key into the
 
 ## Auth & rate limits
 
-Every request carries your key in the `X-HyperVault-Key` header. Keys are
-minted (and revoked) in the web dashboard; the backend stores only a SHA-256
-hash and enforces 60 requests/minute per key.
+Keys are minted (and revoked) in the web dashboard's Vault → Agent API keys
+panel. This MCP server never stores or looks up keys itself — it forwards
+whatever key you give it straight to the real HyperVault backend
+(hypervault.store), which is the only place that ever validates one (it
+stores just a salted SHA-256 hash and enforces 60 requests/minute per key).
+
+How the key gets there depends on the transport:
+
+* **STDIO** (`hypervault-mcp`, no `--transport http`) — a single trusted
+  local process. The key comes from the `HYPERVAULT_API_KEY` environment
+  variable, set once when you start the server (as in Install & run above).
+* **HTTP** (`hypervault-mcp --transport http`, and the hosted Vercel
+  deployment) — a single server can be shared by many callers, so every
+  request must carry *its own* key, sent per-call as either:
+  * `Authorization: Bearer hv_...` (standard, recommended for MCP clients), or
+  * `X-HyperVault-Key: hv_...`
+
+  There is no shared fallback key for HTTP: a request with neither header is
+  rejected with an "Authentication required" tool error before any call
+  reaches the backend, even if the server process happens to have
+  `HYPERVAULT_API_KEY` set in its own environment. Listing the available
+  tools (`tools/list`) doesn't require a key — no user data is involved —
+  but every tool call does. Configure your MCP client to send your key as a
+  header on the hosted endpoint, e.g. for a `mcp.json`-style config:
+
+  ```json
+  {
+    "mcpServers": {
+      "hypervault": {
+        "url": "https://hypervault-mcp.vercel.app/mcp",
+        "headers": { "Authorization": "Bearer hv_your_key_here" }
+      }
+    }
+  }
+  ```
+
+## Tests
+
+```bash
+pip install -e ".[test]"
+pytest
+```
+
+The suite (`tests/`) covers the request-shaping logic of every tool, the
+`_client`/`_request` HTTP layer (mocked with `respx` — no real network
+calls), the `extract_source_prompt` preferred/legacy fallback chain, and —
+most importantly — the per-request auth model: header parsing, the
+STDIO-vs-HTTP key resolution split, and full end-to-end requests against the
+real ASGI app proving an unauthenticated `tools/call` is rejected even when
+an operator `HYPERVAULT_API_KEY` is set in the environment.
 
 ## Smoke test
 
