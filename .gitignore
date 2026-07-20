@@ -148,3 +148,4 @@ __pycache__/
 .vercel
 .env*
 !.env.example
+.DS_Store
