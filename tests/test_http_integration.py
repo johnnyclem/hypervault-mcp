@@ -198,6 +198,99 @@ class TestUnauthenticatedProtocolLevelCallsStillWork:
         tool_names = {t["name"] for t in response.json()["result"]["tools"]}
         assert "save_to_hypervault" in tool_names
         assert "list_my_vault_items" in tool_names
+        assert "create_artifact_group" in tool_names
+
+
+class TestArtifactGroupToolsOverHttp:
+    """End-to-end coverage for the artifact-group tools: local validation
+    still runs (and rejects) before any auth/network call, and a valid call
+    is forwarded with the caller's own key like every other tool."""
+
+    @pytest.mark.asyncio
+    async def test_create_requires_auth_like_every_other_tool(self, http_app, monkeypatch):
+        monkeypatch.delenv("HYPERVAULT_API_KEY", raising=False)
+        response = await _post(
+            http_app,
+            _call_tool_body(
+                "create_artifact_group",
+                {"files": [{"path": "index.html", "content": "<h1>hi</h1>"}]},
+            ),
+        )
+        assert _is_tool_error(response)
+        assert "Authentication required" in _tool_result_text(response)
+
+    @pytest.mark.asyncio
+    async def test_create_validation_error_never_reaches_the_backend(self, http_app, monkeypatch):
+        """Missing the required root index.html must fail locally — before
+        auth is even checked — never hitting the network."""
+        monkeypatch.delenv("HYPERVAULT_API_KEY", raising=False)
+        with respx.mock:
+            route = respx.post(f"{DEFAULT_API_URL}/api/artifact-groups").mock(
+                return_value=httpx.Response(200, json={"url": "should never be reached"})
+            )
+            response = await _post(
+                http_app,
+                _call_tool_body(
+                    "create_artifact_group",
+                    {"files": [{"path": "style.css", "content": "body{}"}]},
+                ),
+                headers={"X-HyperVault-Key": "hv_caller_key"},
+            )
+            assert _is_tool_error(response)
+            assert "root 'index.html'" in _tool_result_text(response)
+            assert not route.called
+
+    @pytest.mark.asyncio
+    async def test_create_success_forwards_callers_key_and_normalized_files(self, http_app, monkeypatch):
+        monkeypatch.delenv("HYPERVAULT_API_KEY", raising=False)
+        with respx.mock:
+            route = respx.post(f"{DEFAULT_API_URL}/api/artifact-groups").mock(
+                return_value=httpx.Response(
+                    200, json={"url": "https://hypervault.store/g/my-app-x7k2p9", "slug": "my-app-x7k2p9"}
+                )
+            )
+            response = await _post(
+                http_app,
+                _call_tool_body(
+                    "create_artifact_group",
+                    {
+                        "files": [
+                            {"path": "index.html", "content": "<h1>hi</h1>"},
+                            {"path": "style.css", "content": "body{}"},
+                        ],
+                        "title": "My App",
+                    },
+                ),
+                headers={"X-HyperVault-Key": "hv_caller_key"},
+            )
+            assert not _is_tool_error(response)
+            assert route.called
+            assert route.calls.last.request.headers["x-hypervault-key"] == "hv_caller_key"
+            sent = json.loads(route.calls.last.request.content)
+            assert sent["files"] == [
+                {"path": "index.html", "content": "<h1>hi</h1>"},
+                {"path": "style.css", "content": "body{}"},
+            ]
+            assert sent["title"] == "My App"
+            assert "my-app-x7k2p9" in _tool_result_text(response)
+
+    @pytest.mark.asyncio
+    async def test_remove_index_html_rejected_before_any_network_call(self, http_app, monkeypatch):
+        monkeypatch.delenv("HYPERVAULT_API_KEY", raising=False)
+        with respx.mock:
+            route = respx.delete(f"{DEFAULT_API_URL}/api/artifact-groups/my-app/items").mock(
+                return_value=httpx.Response(200, json={"ok": True})
+            )
+            response = await _post(
+                http_app,
+                _call_tool_body(
+                    "remove_artifact_group_item", {"ref": "my-app", "path": "index.html"}
+                ),
+                headers={"X-HyperVault-Key": "hv_caller_key"},
+            )
+            assert _is_tool_error(response)
+            assert "Can't remove the root 'index.html'" in _tool_result_text(response)
+            assert not route.called
 
 
 class TestVercelEntrypoint:

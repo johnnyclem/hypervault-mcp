@@ -33,6 +33,13 @@ class TestVaultHelpResource:
             "read_artifact",
             "write_artifact",
             "artifact_history",
+            "create_artifact_group",
+            "read_artifact_group",
+            "list_artifact_groups",
+            "add_artifact_group_item",
+            "edit_artifact_group_item",
+            "remove_artifact_group_item",
+            "delete_artifact_group",
         ]:
             assert tool_name in text, f"{tool_name} missing from help text"
 

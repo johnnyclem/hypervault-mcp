@@ -36,6 +36,13 @@ Authentication differs by transport — see [Auth & rate limits](#auth--rate-lim
 | `artifact_history(ref, full, limit)` | Lists a mutable artifact's version history (git commits), newest first, with authorship. Revert by reading an old version and writing it back. |
 | `extract_source_prompt(url)` | Fetches any artifact URL (vanity domains included) and returns the source prompt from its hidden `<meta name="hypervault-source-prompt">` tag, so you can iterate on the original idea. |
 | `delete_vault_item(slug_or_id)` | Permanently deletes an artifact (and its graph connections). Irreversible — the share URL stops working immediately. |
+| `create_artifact_group(files, title, tags, connect_to, visibility, source_prompt)` | Saves a multi-file **artifact group** — several `.html`/`.css`/`.js`/`.jsx` files that run together — behind a required root `index.html`. Returns a JSFiddle-style run/preview URL (see [Artifact groups](#artifact-groups-multi-file-projects) below). |
+| `read_artifact_group(ref)` | Reads a group's full file set and metadata by slug or URL. |
+| `list_artifact_groups()` | Lists everything already saved as a group. |
+| `add_artifact_group_item(ref, path, content)` | Adds a new file to an existing group (fails if that path already exists). |
+| `edit_artifact_group_item(ref, path, content)` | Replaces an existing file's content, including `index.html` itself (fails if that path doesn't exist yet). |
+| `remove_artifact_group_item(ref, path)` | Removes a file from a group. The root `index.html` can't be removed this way. |
+| `delete_artifact_group(slug_or_id)` | Permanently deletes a whole group. Irreversible. |
 | `memorize(content, title, tags, source)` | Stores a chunk in the user's **private memory wiki** (Imaging V2). Auto-titled, auto-tagged, summarized, and linked to related memories in their knowledge graph. |
 | `recall(query)` | Natural-language search over the wiki ("what did I say about the Rust borrow checker?"). Top matches return the exact stored content; every match lists its linked memories. |
 | `list_memories()` | Browses everything memorized, newest first (summaries + tags). |
@@ -64,6 +71,45 @@ artifact_history(saved["slug"])                    # -> the commit chain, newest
 an old version's content (`read_artifact(ref, version=...)`) and write it back.
 The write tools are owner-scoped (the API key resolves to its owner), so a
 mutable artifact is read and written privately even when the page is public.
+
+### Artifact groups (multi-file projects)
+
+Use an artifact group instead of `save_to_hypervault` when a project needs more
+than one file — separate markup, styles, and script(s) that reference each
+other normally, like a tiny JSFiddle. A group always runs/previews as a
+container at `https://hypervault.store/g/{slug}` — a minimal editor/preview UI
+similar to JSFiddle — routed through a required root `index.html`.
+
+```python
+group = create_artifact_group(
+    files=[
+        {"path": "index.html", "content": "<link rel='stylesheet' href='style.css'><script src='app.js'></script>"},
+        {"path": "style.css", "content": "body { font-family: sans-serif; }"},
+        {"path": "app.js", "content": "console.log('hello from the group')"},
+    ],
+    title="My Widget",
+)
+read_artifact_group(group["slug"])                                   # -> current files + metadata
+add_artifact_group_item(group["slug"], "extra.js", "// more code")   # add a new file
+edit_artifact_group_item(group["slug"], "style.css", "body { color: red; }")  # replace a file's content
+remove_artifact_group_item(group["slug"], "extra.js")                # remove a file (not index.html)
+list_artifact_groups()                                               # browse everything saved
+delete_artifact_group(group["slug"])                                 # permanently delete the group
+```
+
+Validation runs locally before any network call, so bad input never reaches
+the backend:
+
+- Exactly one root file at path `index.html` — the entry point the
+  run/preview container routes through. A nested one like
+  `public/index.html` does not count.
+- Paths must be relative, use `/` as the separator, contain no `..`
+  segments, and only `[A-Za-z0-9._/-]` characters.
+- Extensions are limited to `.html`, `.css`, `.js`, `.jsx`.
+- At most 50 files; 256 KB per file; 1 MB total.
+- Paths must be unique (case-insensitively).
+- The root `index.html` can't be removed with `remove_artifact_group_item` —
+  edit its content instead, or delete the whole group.
 
 ## Claude Desktop / Claude Code config
 
