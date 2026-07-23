@@ -45,6 +45,17 @@ DEFAULT_API_URL = "https://hypervault.store"
 API_KEY_HEADER = "X-HyperVault-Key"
 SOURCE_PROMPT_META_NAME = "hypervault-source-prompt"
 
+# Artifact groups: multi-file containers (HTML/CSS/JS/JSX) that route through
+# a root index.html, previewed/run in a JSFiddle-style container at
+# https://hypervault.store/g/{slug}. Limits mirror the ~1 MB single-artifact
+# guidance in save_to_hypervault's docs.
+GROUP_INDEX_PATH = "index.html"
+GROUP_ALLOWED_EXTENSIONS = (".html", ".css", ".js", ".jsx")
+GROUP_MAX_FILES = 50
+GROUP_MAX_FILE_BYTES = 256_000
+GROUP_MAX_TOTAL_BYTES = 1_000_000
+_GROUP_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+
 mcp = FastMCP(
     name="HyperVault",
     instructions=(
@@ -55,6 +66,11 @@ mcp = FastMCP(
         "save one with mutable=true to get a living document you can rewrite: "
         "read_artifact reads it, write_artifact commits a new iteration, and "
         "artifact_history lists (and lets you revert) those git commits. "
+        "For multi-file projects, use artifact groups instead: "
+        "create_artifact_group bundles several .html/.css/.js/.jsx files "
+        "behind a required root index.html and returns a JSFiddle-style "
+        "run/preview URL; add_artifact_group_item, edit_artifact_group_item, "
+        "and remove_artifact_group_item keep editing it after creation. "
         "HyperVault is also the user's long-term "
         "memory: memorize() stores chunks into their private LLM-wiki and "
         "recall() answers natural-language questions about what they've "
@@ -180,6 +196,126 @@ def _artifact_slug(ref: str) -> str:
             "'my-game-x7k2p9' or a full URL like https://hypervault.store/a/my-game-x7k2p9."
         )
     return cleaned
+
+
+def _artifact_group_slug(ref: str) -> str:
+    """Resolve an artifact-group reference to its slug.
+
+    Accepts a bare slug or a full HyperVault group URL (.../g/{slug},
+    including vanity subdomains) and returns the slug. Raises
+    HyperVaultError on an empty or unusable reference.
+    """
+    cleaned = (ref or "").strip()
+    if not cleaned:
+        raise HyperVaultError("Pass the artifact group's slug or URL.")
+    match = re.search(r"/g/([^/?#]+)", cleaned)
+    if match:
+        return match.group(1)
+    if "://" in cleaned or "/" in cleaned:
+        raise HyperVaultError(
+            "Could not find an artifact-group slug in that reference — pass a slug like "
+            "'my-app-x7k2p9' or a full URL like https://hypervault.store/g/my-app-x7k2p9."
+        )
+    return cleaned
+
+
+def _validate_group_item_path(path: Any) -> str:
+    """Validate a single artifact-group item path, returning it cleaned.
+
+    Enforces: non-empty, relative (no leading slash), no '..' traversal, no
+    backslashes, a restricted safe charset, no empty/duplicate path
+    segments, and one of the allowed file extensions
+    (.html/.css/.js/.jsx). Raises HyperVaultError with a specific,
+    actionable message on the first violation found.
+    """
+    if not isinstance(path, str):
+        raise HyperVaultError(f"Item path {path!r} must be a string.")
+    cleaned = path.strip()
+    if not cleaned:
+        raise HyperVaultError("Every artifact-group item needs a non-empty path.")
+    if cleaned != path:
+        raise HyperVaultError(f"Item path {path!r} has leading/trailing whitespace — pass it trimmed.")
+    if cleaned.startswith("/") or cleaned.startswith("\\"):
+        raise HyperVaultError(f"Item path {cleaned!r} must be relative (no leading slash).")
+    if "\\" in cleaned:
+        raise HyperVaultError(f"Item path {cleaned!r} may not contain backslashes — use '/' as the separator.")
+    if ".." in cleaned.split("/"):
+        raise HyperVaultError(f"Item path {cleaned!r} may not contain '..' path segments.")
+    if "//" in cleaned or cleaned.endswith("/"):
+        raise HyperVaultError(f"Item path {cleaned!r} is not a valid file path.")
+    if not _GROUP_PATH_RE.match(cleaned):
+        raise HyperVaultError(
+            f"Item path {cleaned!r} may only contain letters, digits, '.', '_', '-', and '/' as a "
+            "separator, and must start with a letter or digit."
+        )
+    last_segment = cleaned.rsplit("/", 1)[-1]
+    if "." not in last_segment:
+        raise HyperVaultError(f"Item path {cleaned!r} has no file extension.")
+    ext = "." + last_segment.rsplit(".", 1)[-1].lower()
+    if ext not in GROUP_ALLOWED_EXTENSIONS:
+        raise HyperVaultError(
+            f"Item path {cleaned!r} has an unsupported extension — artifact groups only accept "
+            f"{', '.join(GROUP_ALLOWED_EXTENSIONS)} files."
+        )
+    return cleaned
+
+
+def _validate_group_item_content(path: str, content: Any) -> str:
+    """Validate a single item's content: must be a string within the
+    per-file size cap. Returns the content unchanged."""
+    if not isinstance(content, str):
+        raise HyperVaultError(f"{path!r} content must be a string.")
+    size = len(content.encode("utf-8"))
+    if size > GROUP_MAX_FILE_BYTES:
+        raise HyperVaultError(
+            f"{path!r} is {size} bytes, over the {GROUP_MAX_FILE_BYTES}-byte per-file limit."
+        )
+    return content
+
+
+def _normalize_group_files(files: list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """Validate and normalize a full artifact-group file set for creation.
+
+    Requires at least one file, at most GROUP_MAX_FILES, unique paths
+    (case-insensitive), a total size under GROUP_MAX_TOTAL_BYTES, and a
+    root ``index.html`` — the entry point the run/preview container routes
+    through. Each item must be an object with 'path' and 'content' keys;
+    see _validate_group_item_path / _validate_group_item_content for the
+    per-item rules.
+    """
+    if not files:
+        raise HyperVaultError(
+            "Pass at least one file: files=[{'path': 'index.html', 'content': '...'}, ...]."
+        )
+    if len(files) > GROUP_MAX_FILES:
+        raise HyperVaultError(
+            f"Too many files ({len(files)}) — artifact groups accept at most {GROUP_MAX_FILES}."
+        )
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    total_bytes = 0
+    for i, item in enumerate(files):
+        if not isinstance(item, dict) or "path" not in item or "content" not in item:
+            raise HyperVaultError(f"files[{i}] must be an object with 'path' and 'content' keys.")
+        path = _validate_group_item_path(item["path"])
+        content = _validate_group_item_content(path, item["content"])
+        key = path.lower()
+        if key in seen:
+            raise HyperVaultError(f"Duplicate item path: {path!r}.")
+        seen.add(key)
+        total_bytes += len(content.encode("utf-8"))
+        normalized.append({"path": path, "content": content})
+    if total_bytes > GROUP_MAX_TOTAL_BYTES:
+        raise HyperVaultError(
+            f"Artifact group is {total_bytes} bytes total, over the {GROUP_MAX_TOTAL_BYTES}-byte limit."
+        )
+    if not any(f["path"] == GROUP_INDEX_PATH for f in normalized):
+        raise HyperVaultError(
+            f"Artifact groups must include a root {GROUP_INDEX_PATH!r} file — it's the entry point "
+            "the run/preview container routes through. (A nested one like 'public/index.html' "
+            "doesn't count.)"
+        )
+    return normalized
 
 
 @mcp.tool
@@ -442,6 +578,214 @@ def delete_vault_item(slug_or_id: str) -> dict[str, Any]:
         raise HyperVaultError("Pass the artifact's slug or id to delete.")
     key = "id" if re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", ref) else "slug"
     return _request("DELETE", "/api/artifacts", json={key: ref})
+
+
+@mcp.tool
+def create_artifact_group(
+    files: list[dict[str, str]],
+    title: str = "Untitled",
+    tags: list[str] | None = None,
+    connect_to: list[str] | None = None,
+    visibility: str = "private",
+    source_prompt: str | None = None,
+) -> dict[str, Any]:
+    """Save a multi-file "artifact group" — several .html/.css/.js/.jsx
+    files that run together as one project — to the user's HyperVault.
+
+    Unlike save_to_hypervault (a single file), a group bundles a whole
+    little project: markup, styles, and script(s) as separate files that
+    reference each other normally (e.g. `<link href="style.css">`,
+    `<script src="app.js">`). It is always run/previewed as a container,
+    similar to a JSFiddle: the returned URL opens a minimal editor/preview
+    UI where the files render together, routed through the required root
+    `index.html`.
+
+    Args:
+        files: The group's files, e.g.
+            [{"path": "index.html", "content": "<html>...</html>"},
+             {"path": "style.css", "content": "body { ... }"},
+             {"path": "app.js", "content": "console.log('hi')"}].
+            Rules (validated locally before any network call):
+            - Must include exactly one root file at path "index.html" —
+              the entry point the container routes through. A nested one
+              like "public/index.html" does not count.
+            - Paths must be relative, use '/' separators, contain no '..'
+              segments, and only [A-Za-z0-9._/-] characters.
+            - Extensions are limited to .html, .css, .js, .jsx.
+            - At most 50 files; 256 KB per file; 1 MB total.
+            - Paths must be unique (case-insensitively).
+        title: Human-friendly title shown in the user's vault.
+        tags: Optional tags for organizing the vault (also power
+            auto-connections between items sharing a tag).
+        connect_to: Titles or slugs of related artifacts/groups to link.
+        visibility: "private" (default) or "public".
+        source_prompt: The prompt that produced this group, if any — baked
+            in the same way save_to_hypervault embeds it, so a later agent
+            can read it back and iterate.
+
+    Returns:
+        dict with `url` (the group's permanent, shareable run/preview
+        link), `slug`, `preview_url`, the normalized `files`, and a
+        human-readable `message`.
+    """
+    normalized_files = _normalize_group_files(files)
+    payload = _request(
+        "POST",
+        "/api/artifact-groups",
+        json={
+            "files": normalized_files,
+            "title": title,
+            "tags": tags or [],
+            "connect_to": connect_to or [],
+            "visibility": visibility,
+            "source_prompt": source_prompt or None,
+        },
+    )
+    return payload
+
+
+@mcp.tool
+def read_artifact_group(ref: str) -> dict[str, Any]:
+    """Read an artifact group's full file set and metadata, so you can
+    iterate on it (e.g. before calling edit_artifact_group_item).
+
+    Args:
+        ref: The group's slug (e.g. "my-app-x7k2p9") or full URL
+            (https://hypervault.store/g/my-app-x7k2p9, vanity domains work
+            too).
+
+    Returns:
+        dict with `slug`, `title`, `files` ([{path, content}, ...]),
+        `preview_url`, `visibility`, and timestamps.
+    """
+    slug = _artifact_group_slug(ref)
+    return _request("GET", f"/api/artifact-groups/{slug}")
+
+
+@mcp.tool
+def list_artifact_groups() -> dict[str, Any]:
+    """List the artifact groups already saved in the user's HyperVault.
+
+    Useful before creating a new one (to avoid duplicates) or to find a
+    slug to pass to read_artifact_group / add_artifact_group_item / etc.
+
+    Returns:
+        dict with `items`: a list of {url, slug, title, tags, file_count,
+        visibility, created_at}, newest first.
+    """
+    return _request("GET", "/api/artifact-groups")
+
+
+@mcp.tool
+def add_artifact_group_item(ref: str, path: str, content: str) -> dict[str, Any]:
+    """Add a new file to an existing artifact group.
+
+    Fails if a file already exists at that path — use
+    edit_artifact_group_item to change one, or read_artifact_group first if
+    you're not sure what's already there.
+
+    Args:
+        ref: The group's slug or full URL.
+        path: The new file's path (e.g. "styles/theme.css"). Same rules as
+            create_artifact_group: relative, no '..', [A-Za-z0-9._/-] only,
+            one of .html/.css/.js/.jsx, at most 256 KB.
+        content: The file's full content.
+
+    Returns:
+        dict with the updated `files` list, the added item's `path`, and a
+        `message`.
+    """
+    slug = _artifact_group_slug(ref)
+    clean_path = _validate_group_item_path(path)
+    clean_content = _validate_group_item_content(clean_path, content)
+    return _request(
+        "POST",
+        f"/api/artifact-groups/{slug}/items",
+        json={"path": clean_path, "content": clean_content},
+    )
+
+
+@mcp.tool
+def edit_artifact_group_item(ref: str, path: str, content: str) -> dict[str, Any]:
+    """Replace the content of an existing file in an artifact group.
+
+    Fails if no file exists at that path yet — use add_artifact_group_item
+    to create one. This is also how you update index.html itself.
+
+    Args:
+        ref: The group's slug or full URL.
+        path: The existing file's path to overwrite.
+        content: The new full content for that file (replaces the old
+            content entirely; max 256 KB).
+
+    Returns:
+        dict with the updated `files` list, the edited item's `path`, and a
+        `message`.
+    """
+    slug = _artifact_group_slug(ref)
+    clean_path = _validate_group_item_path(path)
+    clean_content = _validate_group_item_content(clean_path, content)
+    return _request(
+        "PUT",
+        f"/api/artifact-groups/{slug}/items",
+        json={"path": clean_path, "content": clean_content},
+    )
+
+
+@mcp.tool
+def remove_artifact_group_item(ref: str, path: str) -> dict[str, Any]:
+    """Remove a file from an artifact group.
+
+    The root index.html can't be removed this way — a group must always
+    keep its entry point. Replace its content with
+    edit_artifact_group_item instead, or delete the whole group with
+    delete_artifact_group if you no longer need it.
+
+    Args:
+        ref: The group's slug or full URL.
+        path: The file's path to remove.
+
+    Returns:
+        dict with the updated `files` list, the removed `path`, and a
+        `message`.
+    """
+    slug = _artifact_group_slug(ref)
+    clean_path = _validate_group_item_path(path)
+    if clean_path == GROUP_INDEX_PATH:
+        raise HyperVaultError(
+            f"Can't remove the root {GROUP_INDEX_PATH!r} — a group must always keep its entry "
+            "point. Use edit_artifact_group_item to change its content, or delete_artifact_group "
+            "to remove the whole group."
+        )
+    return _request(
+        "DELETE",
+        f"/api/artifact-groups/{slug}/items",
+        json={"path": clean_path},
+    )
+
+
+@mcp.tool
+def delete_artifact_group(slug_or_id: str) -> dict[str, Any]:
+    """Permanently delete an artifact group from the user's HyperVault.
+
+    Deletion is immediate and irreversible: the share/preview URL stops
+    working and the group's graph connections are removed. Use
+    list_artifact_groups first to find the right one, and only delete when
+    the user clearly asks.
+
+    Args:
+        slug_or_id: The group's slug (the last path segment of its URL,
+            e.g. "my-app-x7k2p9") or its id.
+
+    Returns:
+        dict with `deleted` ({id, slug, title}) and a confirmation
+        `message`.
+    """
+    ref = slug_or_id.strip()
+    if not ref:
+        raise HyperVaultError("Pass the artifact group's slug or id to delete.")
+    key = "id" if re.fullmatch(r"[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", ref) else "slug"
+    return _request("DELETE", "/api/artifact-groups", json={key: ref})
 
 
 @mcp.tool
@@ -900,19 +1244,48 @@ def get_vault_help() -> str:
         "6. delete_vault_item(slug_or_id)\n"
         "   Permanently remove an artifact (and its graph connections).\n"
         "   Irreversible — only when the user clearly asks.\n\n"
+        "## Artifact groups (multi-file HTML/CSS/JS/JSX projects)\n"
+        "Use these instead of save_to_hypervault when a project needs more\n"
+        "than one file — separate markup, styles, and script(s) that\n"
+        "reference each other normally. A group always runs/previews as a\n"
+        "JSFiddle-style container at https://hypervault.store/g/{slug},\n"
+        "routed through a required root index.html.\n"
+        "7. create_artifact_group(files, title, tags, connect_to,\n"
+        "   visibility, source_prompt)\n"
+        "   files is [{\"path\": ..., \"content\": ...}, ...]. Must include a\n"
+        "   root \"index.html\"; extensions limited to .html/.css/.js/.jsx;\n"
+        "   paths must be relative with no '..'; at most 50 files, 256 KB\n"
+        "   per file, 1 MB total. Validated locally before any network call.\n"
+        "   Returns the run/preview `url` and `slug`.\n"
+        "8. read_artifact_group(ref)\n"
+        "   Read a group's full file set and metadata by slug or URL.\n"
+        "9. list_artifact_groups()\n"
+        "   List the user's saved groups.\n"
+        "10. add_artifact_group_item(ref, path, content)\n"
+        "    Add a new file to an existing group (fails if that path\n"
+        "    already exists).\n"
+        "11. edit_artifact_group_item(ref, path, content)\n"
+        "    Replace an existing file's content, including index.html\n"
+        "    itself (fails if that path doesn't exist yet).\n"
+        "12. remove_artifact_group_item(ref, path)\n"
+        "    Remove a file from a group. The root index.html can't be\n"
+        "    removed this way — edit it instead, or delete the whole group.\n"
+        "13. delete_artifact_group(slug_or_id)\n"
+        "    Permanently delete a group. Irreversible — only when the user\n"
+        "    clearly asks.\n\n"
         "## Memory (the user's private LLM-wiki)\n"
-        "7. memorize(content, title, tags, source)\n"
+        "14. memorize(content, title, tags, source)\n"
         "   Store a chunk in the user's private memory wiki. It is\n"
         "   auto-titled, auto-tagged, summarized, and linked to related\n"
         "   memories in their knowledge graph. Use whenever the user says\n"
         "   'remember this' or something is clearly worth keeping.\n"
-        "8. recall(query)\n"
+        "15. recall(query)\n"
         "   Natural-language search over the wiki ('what did I say about\n"
         "   the Rust borrow checker?'). Top matches include the exact\n"
         "   stored content plus titles of linked memories to follow.\n"
-        "9. list_memories()\n"
+        "16. list_memories()\n"
         "   Browse everything memorized, newest first (summaries only).\n"
-        "10. forget_memory(memory_id, branch=None)\n"
+        "17. forget_memory(memory_id, branch=None)\n"
         "   Delete a memory — only on the user's explicit request. It is\n"
         "   recorded as a delete commit, so mind_revert can undelete it.\n"
         "Memories are private to the user and never appear on public\n"
@@ -921,39 +1294,39 @@ def get_vault_help() -> str:
         "The wiki is version-controlled like git: every memorize/edit/forget\n"
         "is a commit with full provenance (who wrote it — you'll appear as\n"
         "your key prefix). Nothing is ever lost; history is append-only.\n"
-        "11. edit_memory(memory_id, content, title, tags, message, branch)\n"
+        "18. edit_memory(memory_id, content, title, tags, message, branch)\n"
         "    Edit a wiki page as an update commit.\n"
-        "12. memory_history(memory_id, full, limit)\n"
+        "19. memory_history(memory_id, full, limit)\n"
         "    A page's revisions with their commits — its edit history.\n"
-        "13. mind_log(branch, limit) — commit history of a branch.\n"
-        "14. mind_branches() / mind_branch(name, from_ref)\n"
+        "20. mind_log(branch, limit) — commit history of a branch.\n"
+        "21. mind_branches() / mind_branch(name, from_ref)\n"
         "    List branches / fork a new one. Writes take branch=... so you\n"
         "    can explore ideas without touching main.\n"
-        "15. mind_diff(from_ref, to_ref, memory_id=None)\n"
+        "22. mind_diff(from_ref, to_ref, memory_id=None)\n"
         "    What changed between two branches/commits/timestamps —\n"
         "    memories added/changed/removed with hunks, links added/removed.\n"
-        "16. mind_merge(source, target='main', resolutions=None)\n"
+        "23. mind_merge(source, target='main', resolutions=None)\n"
         "    Three-way merge a branch in; conflicts come back with\n"
         "    base/ours/theirs for you (or the user) to resolve.\n"
-        "17. mind_revert(memory_id, revision_id, branch=None)\n"
+        "24. mind_revert(memory_id, revision_id, branch=None)\n"
         "    Restore an old revision (or undelete) as a new commit.\n"
-        "18. mind_state(at, branch=None)\n"
+        "25. mind_state(at, branch=None)\n"
         "    Time-travel: the whole wiki as of a commit or timestamp.\n\n"
         "## Mutable artifacts (a living document you can rewrite)\n"
         "Artifacts are immutable by default — a save is permanent and re-saving\n"
         "identical content just returns the existing link. Save with\n"
         "mutable=true instead to get a document you can iterate on in place; its\n"
         "URL never changes and every write is kept as a git commit.\n"
-        "19. read_artifact(ref, version=None)\n"
+        "26. read_artifact(ref, version=None)\n"
         "    Read an artifact's current editable source (raw JSX for JSX\n"
         "    artifacts, HTML otherwise). ref is a slug or full URL. Pass a\n"
         "    version id to read a past iteration.\n"
-        "20. write_artifact(ref, content, title=None, message=None,\n"
+        "27. write_artifact(ref, content, title=None, message=None,\n"
         "    force_html=False)\n"
         "    Commit a new iteration of a mutable artifact. The page updates in\n"
         "    place and the write is recorded as a version. Only mutable\n"
         "    artifacts accept writes. Loop: read_artifact → edit → write_artifact.\n"
-        "21. artifact_history(ref, full=False, limit=50)\n"
+        "28. artifact_history(ref, full=False, limit=50)\n"
         "    List the commits, newest first, with authorship. Revert by reading\n"
         "    an old version's content and writing it back.\n\n"
         "## Iterating on an existing artifact\n"

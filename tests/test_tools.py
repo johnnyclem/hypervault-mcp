@@ -195,6 +195,227 @@ class TestDeleteVaultItem:
         )
 
 
+class TestCreateArtifactGroup:
+    def test_minimal_call_defaults(self, fake_request):
+        files = [{"path": "index.html", "content": "<h1>hi</h1>"}]
+        result = server.create_artifact_group(files=files)
+        assert result == {"ok": True}
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/artifact-groups",
+            json={
+                "files": files,
+                "title": "Untitled",
+                "tags": [],
+                "connect_to": [],
+                "visibility": "private",
+                "source_prompt": None,
+            },
+        )
+
+    def test_full_call_passes_through_all_fields(self, fake_request):
+        files = [
+            {"path": "index.html", "content": "<html></html>"},
+            {"path": "style.css", "content": "body{}"},
+            {"path": "app.js", "content": "console.log(1)"},
+        ]
+        server.create_artifact_group(
+            files=files,
+            title="My Game",
+            tags=["a", "b"],
+            connect_to=["other-slug"],
+            visibility="public",
+            source_prompt="build a game",
+        )
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"] == {
+            "files": files,
+            "title": "My Game",
+            "tags": ["a", "b"],
+            "connect_to": ["other-slug"],
+            "visibility": "public",
+            "source_prompt": "build a game",
+        }
+
+    def test_missing_index_html_raises_without_calling_request(self, fake_request):
+        files = [{"path": "style.css", "content": "body{}"}]
+        with pytest.raises(HyperVaultError, match="root 'index.html'"):
+            server.create_artifact_group(files=files)
+        fake_request.assert_not_called()
+
+    def test_empty_files_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="at least one file"):
+            server.create_artifact_group(files=[])
+        fake_request.assert_not_called()
+
+    def test_path_traversal_raises_without_calling_request(self, fake_request):
+        files = [
+            {"path": "index.html", "content": "hi"},
+            {"path": "../evil.js", "content": "bad"},
+        ]
+        with pytest.raises(HyperVaultError, match="'\\.\\.'"):
+            server.create_artifact_group(files=files)
+        fake_request.assert_not_called()
+
+    def test_disallowed_extension_raises_without_calling_request(self, fake_request):
+        files = [
+            {"path": "index.html", "content": "hi"},
+            {"path": "server.py", "content": "print(1)"},
+        ]
+        with pytest.raises(HyperVaultError, match="unsupported extension"):
+            server.create_artifact_group(files=files)
+        fake_request.assert_not_called()
+
+    def test_duplicate_path_raises_without_calling_request(self, fake_request):
+        files = [
+            {"path": "index.html", "content": "a"},
+            {"path": "index.html", "content": "b"},
+        ]
+        with pytest.raises(HyperVaultError, match="Duplicate item path"):
+            server.create_artifact_group(files=files)
+        fake_request.assert_not_called()
+
+
+class TestReadArtifactGroup:
+    def test_by_slug(self, fake_request):
+        server.read_artifact_group("my-app-x7k2p9")
+        fake_request.assert_called_once_with("GET", "/api/artifact-groups/my-app-x7k2p9")
+
+    def test_resolves_ref_from_url(self, fake_request):
+        server.read_artifact_group("https://hypervault.store/g/my-app-x7k2p9")
+        fake_request.assert_called_once_with("GET", "/api/artifact-groups/my-app-x7k2p9")
+
+    def test_blank_ref_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="Pass the artifact group's slug or URL"):
+            server.read_artifact_group("   ")
+        fake_request.assert_not_called()
+
+
+class TestListArtifactGroups:
+    def test_no_params(self, fake_request):
+        server.list_artifact_groups()
+        fake_request.assert_called_once_with("GET", "/api/artifact-groups")
+
+
+class TestAddArtifactGroupItem:
+    def test_adds_item(self, fake_request):
+        server.add_artifact_group_item("my-app-x7k2p9", "style.css", "body{}")
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/artifact-groups/my-app-x7k2p9/items",
+            json={"path": "style.css", "content": "body{}"},
+        )
+
+    def test_resolves_ref_from_url(self, fake_request):
+        server.add_artifact_group_item(
+            "https://hypervault.store/g/my-app-x7k2p9", "style.css", "body{}"
+        )
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/artifact-groups/my-app-x7k2p9/items",
+            json={"path": "style.css", "content": "body{}"},
+        )
+
+    def test_bad_path_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="'\\.\\.'"):
+            server.add_artifact_group_item("my-app-x7k2p9", "../evil.js", "bad")
+        fake_request.assert_not_called()
+
+    def test_disallowed_extension_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="unsupported extension"):
+            server.add_artifact_group_item("my-app-x7k2p9", "data.json", "{}")
+        fake_request.assert_not_called()
+
+    def test_oversized_content_raises_without_calling_request(self, fake_request):
+        from hypervault_mcp.server import GROUP_MAX_FILE_BYTES
+
+        with pytest.raises(HyperVaultError, match="per-file limit"):
+            server.add_artifact_group_item("my-app-x7k2p9", "app.js", "a" * (GROUP_MAX_FILE_BYTES + 1))
+        fake_request.assert_not_called()
+
+
+class TestEditArtifactGroupItem:
+    def test_edits_item(self, fake_request):
+        server.edit_artifact_group_item("my-app-x7k2p9", "index.html", "<h1>v2</h1>")
+        fake_request.assert_called_once_with(
+            "PUT",
+            "/api/artifact-groups/my-app-x7k2p9/items",
+            json={"path": "index.html", "content": "<h1>v2</h1>"},
+        )
+
+    def test_resolves_ref_from_url(self, fake_request):
+        server.edit_artifact_group_item(
+            "https://hypervault.store/g/my-app-x7k2p9", "index.html", "<h1>v2</h1>"
+        )
+        fake_request.assert_called_once_with(
+            "PUT",
+            "/api/artifact-groups/my-app-x7k2p9/items",
+            json={"path": "index.html", "content": "<h1>v2</h1>"},
+        )
+
+    def test_bad_path_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="must be relative"):
+            server.edit_artifact_group_item("my-app-x7k2p9", "/index.html", "hi")
+        fake_request.assert_not_called()
+
+
+class TestRemoveArtifactGroupItem:
+    def test_removes_item(self, fake_request):
+        server.remove_artifact_group_item("my-app-x7k2p9", "style.css")
+        fake_request.assert_called_once_with(
+            "DELETE",
+            "/api/artifact-groups/my-app-x7k2p9/items",
+            json={"path": "style.css"},
+        )
+
+    def test_resolves_ref_from_url(self, fake_request):
+        server.remove_artifact_group_item("https://hypervault.store/g/my-app-x7k2p9", "style.css")
+        fake_request.assert_called_once_with(
+            "DELETE",
+            "/api/artifact-groups/my-app-x7k2p9/items",
+            json={"path": "style.css"},
+        )
+
+    def test_removing_index_html_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="Can't remove the root 'index.html'"):
+            server.remove_artifact_group_item("my-app-x7k2p9", "index.html")
+        fake_request.assert_not_called()
+
+    def test_bad_path_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="'\\.\\.'"):
+            server.remove_artifact_group_item("my-app-x7k2p9", "../evil.js")
+        fake_request.assert_not_called()
+
+
+class TestDeleteArtifactGroup:
+    def test_deletes_by_slug(self, fake_request):
+        server.delete_artifact_group("my-app-x7k2p9")
+        fake_request.assert_called_once_with(
+            "DELETE", "/api/artifact-groups", json={"slug": "my-app-x7k2p9"}
+        )
+
+    def test_deletes_by_uuid(self, fake_request):
+        uuid = "550e8400-e29b-41d4-a716-446655440000"
+        server.delete_artifact_group(uuid)
+        fake_request.assert_called_once_with("DELETE", "/api/artifact-groups", json={"id": uuid})
+
+    def test_uuid_is_case_insensitive(self, fake_request):
+        uuid = "550E8400-E29B-41D4-A716-446655440000"
+        server.delete_artifact_group(uuid)
+        fake_request.assert_called_once_with("DELETE", "/api/artifact-groups", json={"id": uuid})
+
+    def test_blank_ref_raises_without_calling_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="Pass the artifact group's slug or id"):
+            server.delete_artifact_group("   ")
+        fake_request.assert_not_called()
+
+    def test_strips_whitespace(self, fake_request):
+        server.delete_artifact_group("  my-app  ")
+        fake_request.assert_called_once_with(
+            "DELETE", "/api/artifact-groups", json={"slug": "my-app"}
+        )
+
+
 class TestMemorize:
     def test_defaults(self, fake_request):
         server.memorize("some content")
