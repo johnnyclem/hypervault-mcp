@@ -40,6 +40,14 @@ class TestVaultHelpResource:
             "edit_artifact_group_item",
             "remove_artifact_group_item",
             "delete_artifact_group",
+            "create_task_board",
+            "list_task_boards",
+            "tasklist_get",
+            "tasklist_summary",
+            "task_create",
+            "task_update",
+            "task_claim",
+            "task_complete",
         ]:
             assert tool_name in text, f"{tool_name} missing from help text"
 

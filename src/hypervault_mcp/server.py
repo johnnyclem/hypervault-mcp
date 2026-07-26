@@ -77,7 +77,13 @@ mcp = FastMCP(
         "stored — use them whenever the user says 'remember this' or asks "
         "about something from a past session. The wiki is versioned like git "
         "(a 'git for a mind'): every write is a commit, and the mind_* tools "
-        "branch, merge, diff, time-travel, and revert the user's memory."
+        "branch, merge, diff, time-travel, and revert the user's memory. "
+        "HyperVault also hosts universal task boards — shared, versioned task "
+        "lists the user watches and steers live from a board page while you "
+        "work: read the list at session start (tasklist_get), claim a task "
+        "before starting it (task_claim), push every meaningful change "
+        "immediately (task_update / task_complete), and re-read periodically "
+        "with since_version so the user's steering is respected."
     ),
 )
 
@@ -171,6 +177,13 @@ def _request(
         payload = {}
 
     if response.status_code >= 400:
+        # Task-board version conflicts (409 with conflict: true) carry the
+        # *entire* fresh list under `latest` — exactly what the caller needs to
+        # re-apply its change on top. Raising would discard it (a tool error is
+        # only a message string), so hand the whole payload back instead and
+        # let the task_* docstrings tell agents to check `conflict`.
+        if response.status_code == 409 and isinstance(payload, dict) and payload.get("conflict"):
+            return payload
         error = payload.get("error") if isinstance(payload, dict) else None
         raise HyperVaultError(error or f"HyperVault returned HTTP {response.status_code}.")
     return payload
@@ -1129,6 +1142,425 @@ def mind_state(at: str, branch: str | None = None) -> dict[str, Any]:
     return _request("GET", "/api/mind/state", params=params)
 
 
+def _tasklist_project(project: str) -> str:
+    """Resolve a task-board reference to the path segment the API expects.
+
+    The backend accepts a project id ("eurorack-choir"), the data artifact's
+    slug ("tasks-eurorack-choir"), or a full artifact URL — but a URL can't be
+    dropped into a path segment as-is, so pull the slug out of it first.
+    """
+    cleaned = (project or "").strip()
+    if not cleaned:
+        raise HyperVaultError(
+            "Pass the task board's project id (e.g. 'eurorack-choir'), its data slug, or its URL. "
+            "Use list_task_boards to see what's there."
+        )
+    match = re.search(r"/a/([^/?#]+)", cleaned)
+    if match:
+        return match.group(1)
+    if "://" in cleaned or "/" in cleaned:
+        raise HyperVaultError(
+            "Could not find a task board in that reference — pass a project id like "
+            "'eurorack-choir', a data slug like 'tasks-eurorack-choir', or a full URL like "
+            "https://hypervault.store/a/tasks-eurorack-choir."
+        )
+    return cleaned
+
+
+def _task_id(task_id: str) -> str:
+    """Validate a task id, returning it trimmed."""
+    cleaned = (task_id or "").strip()
+    if not cleaned:
+        raise HyperVaultError("Pass the task's id (see tasklist_get for the current list).")
+    return cleaned
+
+
+def _actor(agent_name: str | None, agent_type: str | None) -> dict[str, str] | None:
+    """Build the `actor` body field from the agent identity kwargs.
+
+    Returns None when neither is given, so the field is left out of the body
+    entirely and the backend falls back to a key-derived name.
+    """
+    actor: dict[str, str] = {}
+    name = (agent_name or "").strip()
+    if name:
+        actor["name"] = name
+    kind = (agent_type or "").strip()
+    if kind:
+        actor["agentType"] = kind
+    return actor or None
+
+
+def _task_write_body(
+    payload: dict[str, Any],
+    expected_version: int | None,
+    agent_name: str | None,
+    agent_type: str | None,
+) -> dict[str, Any]:
+    """Add the optional `expected_version` / `actor` fields shared by every
+    task write, omitting each one when it has nothing to say."""
+    body = dict(payload)
+    if expected_version is not None:
+        body["expected_version"] = expected_version
+    actor = _actor(agent_name, agent_type)
+    if actor:
+        body["actor"] = actor
+    return body
+
+
+@mcp.tool
+def create_task_board(
+    title: str,
+    project: str | None = None,
+    tasks: list[dict[str, Any]] | None = None,
+    stages: list[str] | None = None,
+    visibility: str = "private",
+) -> dict[str, Any]:
+    """Create a universal task board — a shared, versioned task list that you
+    and the user work from together.
+
+    One call creates both halves: a JSON data artifact (`tasks-{project}`) that
+    you sync through with the other task_* tools, and an interactive board page
+    (`taskboard-{project}`) the user opens to watch and steer the work live.
+    **The board URL is the deliverable** — after creating one, tell the user to
+    open `board.url`; the data artifact isn't meant to be read by humans.
+
+    Use this at the start of any multi-step piece of work the user will want
+    visibility into. Seed it with the plan you already have — passing `tasks`
+    up front is much better than creating an empty board and adding tasks one
+    call at a time.
+
+    Args:
+        title: Human-friendly board title (e.g. "Eurorack choir firmware").
+        project: Optional project id/slug (e.g. "eurorack-choir"). Derived
+            from the title when omitted; it's what every other task_* tool
+            takes as `project`.
+        tasks: Optional initial tasks, e.g.
+            [{"id": "epic-1", "title": "Firmware", "type": "epic"},
+             {"title": "Bring up I2S", "parent": "epic-1", "priority": "high"}].
+            Per task: `title` (required), `type` ("task" or "epic"),
+            `parent` (an epic's id), `id` (yours, if you want to reference it
+            in the same call), `priority`, `description`.
+        stages: Optional column names for the board page (e.g.
+            ["Backlog", "Building", "Review", "Done"]).
+        visibility: "private" (default) or "public".
+
+    Returns:
+        dict with `project` (pass this to every other task_* tool), `data`
+        ({slug, url} — the JSON artifact), `board` ({slug, url} — the human
+        page to hand the user), the `schema` URL, and a `message`.
+    """
+    body: dict[str, Any] = {"title": title, "visibility": visibility}
+    if project:
+        body["project"] = project
+    if tasks is not None:
+        body["tasks"] = tasks
+    if stages is not None:
+        body["stages"] = stages
+    return _request("POST", "/api/taskboards", json=body)
+
+
+@mcp.tool
+def list_task_boards() -> dict[str, Any]:
+    """List the user's existing task boards, so you can join one instead of
+    creating a duplicate.
+
+    Call this at session start when the user refers to ongoing work ("keep
+    going on the choir firmware") and you don't already have the project id.
+
+    Returns:
+        dict with `boards`: [{slug, project, title, url, created_at,
+        updated_at}], and the `schema` URL.
+    """
+    return _request("GET", "/api/taskboards")
+
+
+@mcp.tool
+def tasklist_get(project: str, since_version: int | None = None) -> dict[str, Any]:
+    """Read a task board's full list — every task with its status, assignee,
+    lock, and note thread.
+
+    Read this at session start, and re-poll it at tool boundaries so the
+    user's steering from the board page (re-prioritizing, adding tasks,
+    unblocking you) is picked up while you work. Pass `since_version` for the
+    cheap poll: when nothing changed you get `{unchanged: true, version}` back
+    instead of the whole list.
+
+    Args:
+        project: The board's project id, data slug, or URL.
+        since_version: The `version` you last saw. Omit for a full read.
+
+    Returns:
+        dict with `slug` and `tasklist` ({id, title, version, stages, tasks:
+        [{id, title, type, status, parent, priority, progress, assignee,
+        lock, notes, metadata, ...}]}) — or `{unchanged: true, version}` when
+        `since_version` is current.
+    """
+    slug = _tasklist_project(project)
+    params = {"since_version": since_version} if since_version is not None else None
+    return _request("GET", f"/api/tasklists/{slug}", params=params)
+
+
+@mcp.tool
+def tasklist_summary(project: str) -> dict[str, Any]:
+    """Get a board's rollup — counts, progress, epics, and who's holding what
+    — without pulling every task.
+
+    Prefer this over tasklist_get whenever you're reporting status to the
+    user or deciding what to pick up next; a large board's full list is
+    token-heavy.
+
+    Args:
+        project: The board's project id, data slug, or URL.
+
+    Returns:
+        dict with `summary`: {id, title, version, total, byStatus, progress,
+        epics, claimed, unassigned}.
+    """
+    slug = _tasklist_project(project)
+    return _request("GET", f"/api/tasklists/{slug}/summary")
+
+
+@mcp.tool
+def task_create(
+    project: str,
+    title: str,
+    type: str = "task",
+    parent: str | None = None,
+    description: str | None = None,
+    priority: str | None = None,
+    active_form: str | None = None,
+    depends_on: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    expected_version: int | None = None,
+    agent_name: str | None = None,
+    agent_type: str | None = None,
+) -> dict[str, Any]:
+    """Add a task to an existing board.
+
+    Add work as you discover it — a task you create here shows up on the
+    user's board immediately, which is the point. Prefer seeding known work
+    through create_task_board's `tasks` argument; use this for what comes up
+    mid-session.
+
+    Args:
+        project: The board's project id, data slug, or URL.
+        title: What the task is (imperative, e.g. "Bring up I2S clocking").
+        type: "task" (default) or "epic" (a parent other tasks hang under).
+        parent: An epic's task id, when this is a child of one.
+        description: Optional longer detail.
+        priority: "low", "medium", "high", or "critical".
+        active_form: Present-tense label the board shows while the task runs
+            (e.g. "Bringing up I2S clocking").
+        depends_on: Task ids that must finish first.
+        metadata: Free-form JSON. Set `metadata.externalId` to your native
+            todo/task id so the two lists map back and forth.
+        expected_version: The list `version` you're writing against. Pass it
+            whenever you have one — see the conflict note below.
+        agent_name: Stable, readable name for you (e.g.
+            "claude-code:session-abc"). Always pass one.
+        agent_type: Optional agent family (e.g. "claude-code").
+
+    A version conflict comes back as `{conflict: true, latest, error}` where
+    `latest` is the whole fresh list — re-apply your change on top of it and
+    retry; don't overwrite.
+
+    Returns:
+        dict with the created `task`, the updated `tasklist`, the `commit`,
+        and a `message`.
+    """
+    slug = _tasklist_project(project)
+    task: dict[str, Any] = {"title": title, "type": type}
+    if parent is not None:
+        task["parent"] = parent
+    if description is not None:
+        task["description"] = description
+    if priority is not None:
+        task["priority"] = priority
+    if active_form is not None:
+        task["activeForm"] = active_form
+    if depends_on is not None:
+        task["dependsOn"] = depends_on
+    if metadata is not None:
+        task["metadata"] = metadata
+    body = _task_write_body({"task": task}, expected_version, agent_name, agent_type)
+    return _request("POST", f"/api/tasklists/{slug}/tasks", json=body)
+
+
+@mcp.tool
+def task_update(
+    project: str,
+    task_id: str,
+    status: str | None = None,
+    progress: int | None = None,
+    note: str | None = None,
+    title: str | None = None,
+    description: str | None = None,
+    priority: str | None = None,
+    active_form: str | None = None,
+    parent: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    expected_version: int | None = None,
+    agent_name: str | None = None,
+    agent_type: str | None = None,
+) -> dict[str, Any]:
+    """Patch one task on a board — status, progress, a note, or any other
+    field. Only the arguments you pass are changed.
+
+    Push every meaningful change the moment it happens: the user's board polls
+    the same list, so a note or a progress bump is how they see you're alive
+    and steer you before you go too far. `note` *appends* to the task's thread
+    (nothing is overwritten) and `metadata` *merges* key-wise.
+
+    Args:
+        project: The board's project id, data slug, or URL.
+        task_id: The task to patch (from tasklist_get).
+        status: "todo", "in_progress", "blocked", "review", "done", or
+            "cancelled". Setting "done" also releases your lock.
+        progress: 0–100.
+        note: A line to append to the task's thread — what you did, what you
+            found, why you're blocked.
+        title: New title.
+        description: New description.
+        priority: "low", "medium", "high", or "critical".
+        active_form: New present-tense label.
+        parent: Re-parent under this epic's task id.
+        metadata: Keys to merge into the task's metadata.
+        expected_version: The list `version` you're writing against — pass it
+            whenever you have one.
+        agent_name: Stable, readable name for you.
+        agent_type: Optional agent family.
+
+    A version conflict comes back as `{conflict: true, latest, error}` where
+    `latest` is the whole fresh list — re-apply your change on top of it and
+    retry; don't overwrite.
+
+    Returns:
+        dict with the updated `task`, the full `tasklist`, the `commit`, and a
+        `message`.
+    """
+    slug = _tasklist_project(project)
+    task = _task_id(task_id)
+    candidates = {
+        "status": status,
+        "progress": progress,
+        "note": note,
+        "title": title,
+        "description": description,
+        "priority": priority,
+        "activeForm": active_form,
+        "parent": parent,
+        "metadata": metadata,
+    }
+    patch = {key: value for key, value in candidates.items() if value is not None}
+    if not patch:
+        raise HyperVaultError(
+            "Nothing to update — pass at least one field to change (status, progress, note, "
+            "title, description, priority, active_form, parent, or metadata)."
+        )
+    body = _task_write_body({"patch": patch}, expected_version, agent_name, agent_type)
+    return _request("PATCH", f"/api/tasklists/{slug}/tasks/{task}", json=body)
+
+
+@mcp.tool
+def task_claim(
+    project: str,
+    task_id: str,
+    agent_name: str,
+    agent_type: str | None = None,
+    force: bool = False,
+    release: bool = False,
+    lock_minutes: int | None = None,
+    expected_version: int | None = None,
+) -> dict[str, Any]:
+    """Claim a task before you start it — a lock plus assignment, so multiple
+    agents can share one board without colliding.
+
+    Claiming sets the task to in_progress, assigns it to you, and takes a lock
+    (60 minutes by default, 24 h max; re-claiming your own task renews it).
+    Claim deliberately: prefer tasks already assigned to you or unassigned,
+    and never silently take another agent's live claim — a live foreign lock
+    fails with a 409 naming the holder. Use `force` only when the holder is
+    clearly gone (expired locks are claimable without it).
+
+    Args:
+        project: The board's project id, data slug, or URL.
+        task_id: The task to claim (from tasklist_get).
+        agent_name: Stable, readable name for you (e.g.
+            "claude-code:session-abc"). Required — a claim with no identifiable
+            holder is meaningless.
+        agent_type: Optional agent family (e.g. "claude-code").
+        force: Take over a live foreign lock. Only when the holder is gone.
+        release: Hand the task back instead of claiming it — do this when you
+            stop working on something you didn't finish.
+        lock_minutes: Lock duration (default 60, max 1440).
+        expected_version: The list `version` you're writing against.
+
+    Returns:
+        dict with the claimed `task` (assignee + lock), the `tasklist`, the
+        `commit`, and a `message`. A version conflict comes back as
+        `{conflict: true, latest, error}`.
+    """
+    slug = _tasklist_project(project)
+    task = _task_id(task_id)
+    name = (agent_name or "").strip()
+    if not name:
+        raise HyperVaultError(
+            "Pass agent_name — a claim needs a stable, readable holder name "
+            "(e.g. 'claude-code:session-abc')."
+        )
+    body: dict[str, Any] = {"actor": _actor(name, agent_type)}
+    if force:
+        body["force"] = True
+    if release:
+        body["release"] = True
+    if lock_minutes is not None:
+        body["lock_minutes"] = lock_minutes
+    if expected_version is not None:
+        body["expected_version"] = expected_version
+    return _request("POST", f"/api/tasklists/{slug}/tasks/{task}/claim", json=body)
+
+
+@mcp.tool
+def task_complete(
+    project: str,
+    task_id: str,
+    note: str | None = None,
+    expected_version: int | None = None,
+    agent_name: str | None = None,
+    agent_type: str | None = None,
+) -> dict[str, Any]:
+    """Mark a task done: status done, progress 100, lock released, in one call.
+
+    Complete a task as soon as it's actually finished — don't batch
+    completions at the end of a session; the user is watching the board fill
+    in. Pass a closing `note` saying what landed. A done task can't be
+    re-claimed.
+
+    Args:
+        project: The board's project id, data slug, or URL.
+        task_id: The task to complete.
+        note: Closing note appended to the task's thread (what you did, where
+            the result lives).
+        expected_version: The list `version` you're writing against.
+        agent_name: Stable, readable name for you.
+        agent_type: Optional agent family.
+
+    Returns:
+        dict with the completed `task`, the `tasklist`, the list `summary`
+        (counts and progress — good for reporting back to the user), the
+        `commit`, and a `message`. A version conflict comes back as
+        `{conflict: true, latest, error}`.
+    """
+    slug = _tasklist_project(project)
+    task = _task_id(task_id)
+    payload: dict[str, Any] = {}
+    if note is not None:
+        payload["note"] = note
+    body = _task_write_body(payload, expected_version, agent_name, agent_type)
+    return _request("POST", f"/api/tasklists/{slug}/tasks/{task}/complete", json=body)
+
+
 def _find_source_prompt_meta(page_html: str) -> str | None:
     """Pull the hidden source-prompt meta tag out of artifact HTML.
 
@@ -1329,6 +1761,48 @@ def get_vault_help() -> str:
         "28. artifact_history(ref, full=False, limit=50)\n"
         "    List the commits, newest first, with authorship. Revert by reading\n"
         "    an old version's content and writing it back.\n\n"
+        "## Universal task boards (shared work lists)\n"
+        "A task board is a shared, versioned task list that you and the user\n"
+        "work from together: you sync through the tools below, while the user\n"
+        "watches and steers from a live board page. Every write is a version\n"
+        "(audit trail + rollback), and claims are locks, so several agents can\n"
+        "share one board without colliding.\n"
+        "29. create_task_board(title, project=None, tasks=None, stages=None,\n"
+        "    visibility='private')\n"
+        "    Creates the data list and the human board page in one call. Seed\n"
+        "    `tasks` with the plan you already have. Returns `project` (what\n"
+        "    every other task tool takes) and `board.url` — hand that URL to\n"
+        "    the user; it's the living UI. The data artifact is not for humans.\n"
+        "30. list_task_boards() — find an existing board before creating one.\n"
+        "31. tasklist_get(project, since_version=None)\n"
+        "    The full list. With since_version you get {unchanged: true} when\n"
+        "    nothing moved — the cheap poll.\n"
+        "32. tasklist_summary(project)\n"
+        "    Counts, progress, epics, who holds what. Prefer this over the\n"
+        "    full list for status reporting on a large board.\n"
+        "33. task_create(project, title, type='task', parent=..., priority=...,\n"
+        "    metadata=..., expected_version=..., agent_name=...)\n"
+        "34. task_update(project, task_id, status=..., progress=..., note=...,\n"
+        "    ...) — `note` appends to the task's thread; `metadata` merges.\n"
+        "35. task_claim(project, task_id, agent_name, force=False,\n"
+        "    release=False, lock_minutes=None)\n"
+        "36. task_complete(project, task_id, note=None) — done, 100%, lock\n"
+        "    released; the response includes the list summary.\n\n"
+        "### The protocol\n"
+        "- Read the list at session start; re-poll with since_version at tool\n"
+        "  boundaries so the user's steering is picked up while you work.\n"
+        "- Claim deliberately: prefer tasks assigned to you or unassigned.\n"
+        "  Never silently take another agent's live claim — use force only\n"
+        "  when the holder is clearly gone (expired locks need no force).\n"
+        "- Push every meaningful change immediately. The human's board polls\n"
+        "  the same list; a stale board is a user steering blind.\n"
+        "- Send expected_version on writes. On a conflict you get back\n"
+        "  {conflict: true, latest, error} with the whole fresh list —\n"
+        "  re-apply your change on top of `latest`, don't overwrite.\n"
+        "- Map to your native task tools both ways via metadata.externalId.\n"
+        "Statuses: todo | in_progress | blocked | review | done | cancelled.\n"
+        "Priorities: low | medium | high | critical. Locks last 60 minutes by\n"
+        "default (24 h max); marking a task done releases the lock.\n\n"
         "## Iterating on an existing artifact\n"
         "Call extract_source_prompt(url) — or fetch the page and read the\n"
         "<meta name=\"hypervault-source-prompt\"> tag in <head> — that is the\n"

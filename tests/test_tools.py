@@ -638,3 +638,300 @@ class TestMindState:
             "/api/mind/state",
             params={"at": "2026-06-01T00:00:00Z", "branch": "ideas"},
         )
+
+
+class TestCreateTaskBoard:
+    def test_minimal_call_defaults(self, fake_request):
+        server.create_task_board(title="Eurorack choir")
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/taskboards",
+            json={"title": "Eurorack choir", "visibility": "private"},
+        )
+
+    def test_omits_unset_optional_fields(self, fake_request):
+        server.create_task_board(title="Board", project=None, tasks=None, stages=None)
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert "project" not in kwargs["json"]
+        assert "tasks" not in kwargs["json"]
+        assert "stages" not in kwargs["json"]
+
+    def test_full_call_passes_through(self, fake_request):
+        tasks = [
+            {"id": "epic-1", "title": "Firmware", "type": "epic"},
+            {"title": "Bring up I2S", "parent": "epic-1"},
+        ]
+        server.create_task_board(
+            title="Eurorack choir",
+            project="eurorack-choir",
+            tasks=tasks,
+            stages=["Backlog", "Building", "Done"],
+            visibility="public",
+        )
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/taskboards",
+            json={
+                "title": "Eurorack choir",
+                "visibility": "public",
+                "project": "eurorack-choir",
+                "tasks": tasks,
+                "stages": ["Backlog", "Building", "Done"],
+            },
+        )
+
+    def test_empty_task_list_is_still_sent(self, fake_request):
+        # [] is a deliberate "start empty", not an omission.
+        server.create_task_board(title="Board", tasks=[])
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"]["tasks"] == []
+
+
+class TestListTaskBoards:
+    def test_lists(self, fake_request):
+        server.list_task_boards()
+        fake_request.assert_called_once_with("GET", "/api/taskboards")
+
+
+class TestTasklistGet:
+    def test_without_since_version(self, fake_request):
+        server.tasklist_get("eurorack-choir")
+        fake_request.assert_called_once_with(
+            "GET", "/api/tasklists/eurorack-choir", params=None
+        )
+
+    def test_with_since_version(self, fake_request):
+        server.tasklist_get("eurorack-choir", since_version=7)
+        fake_request.assert_called_once_with(
+            "GET", "/api/tasklists/eurorack-choir", params={"since_version": 7}
+        )
+
+    def test_since_version_zero_is_sent(self, fake_request):
+        server.tasklist_get("eurorack-choir", since_version=0)
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["params"] == {"since_version": 0}
+
+    def test_url_reference_is_resolved_to_a_slug(self, fake_request):
+        server.tasklist_get("https://hypervault.store/a/tasks-eurorack-choir")
+        fake_request.assert_called_once_with(
+            "GET", "/api/tasklists/tasks-eurorack-choir", params=None
+        )
+
+    def test_empty_project_raises_before_any_call(self, fake_request):
+        with pytest.raises(HyperVaultError):
+            server.tasklist_get("  ")
+        fake_request.assert_not_called()
+
+
+class TestTasklistSummary:
+    def test_summary(self, fake_request):
+        server.tasklist_summary("eurorack-choir")
+        fake_request.assert_called_once_with(
+            "GET", "/api/tasklists/eurorack-choir/summary"
+        )
+
+
+class TestTaskCreate:
+    def test_minimal_call(self, fake_request):
+        server.task_create("eurorack-choir", title="Bring up I2S")
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/tasklists/eurorack-choir/tasks",
+            json={"task": {"title": "Bring up I2S", "type": "task"}},
+        )
+
+    def test_snake_case_args_map_to_camel_case_fields(self, fake_request):
+        server.task_create(
+            "eurorack-choir",
+            title="Bring up I2S",
+            active_form="Bringing up I2S",
+            depends_on=["task-1"],
+        )
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"]["task"]["activeForm"] == "Bringing up I2S"
+        assert kwargs["json"]["task"]["dependsOn"] == ["task-1"]
+
+    def test_full_call(self, fake_request):
+        server.task_create(
+            "eurorack-choir",
+            title="Bring up I2S",
+            type="epic",
+            parent="epic-1",
+            description="clocking first",
+            priority="high",
+            active_form="Bringing up I2S",
+            depends_on=["task-1"],
+            metadata={"externalId": "todo-9"},
+            expected_version=4,
+            agent_name="claude-code:session-abc",
+            agent_type="claude-code",
+        )
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/tasklists/eurorack-choir/tasks",
+            json={
+                "task": {
+                    "title": "Bring up I2S",
+                    "type": "epic",
+                    "parent": "epic-1",
+                    "description": "clocking first",
+                    "priority": "high",
+                    "activeForm": "Bringing up I2S",
+                    "dependsOn": ["task-1"],
+                    "metadata": {"externalId": "todo-9"},
+                },
+                "expected_version": 4,
+                "actor": {"name": "claude-code:session-abc", "agentType": "claude-code"},
+            },
+        )
+
+    def test_actor_omitted_when_no_identity_given(self, fake_request):
+        server.task_create("eurorack-choir", title="x")
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert "actor" not in kwargs["json"]
+        assert "expected_version" not in kwargs["json"]
+
+    def test_expected_version_zero_is_sent(self, fake_request):
+        server.task_create("eurorack-choir", title="x", expected_version=0)
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"]["expected_version"] == 0
+
+
+class TestTaskUpdate:
+    def test_only_non_none_fields_are_patched(self, fake_request):
+        server.task_update("eurorack-choir", "task-1", status="in_progress", progress=50)
+        fake_request.assert_called_once_with(
+            "PATCH",
+            "/api/tasklists/eurorack-choir/tasks/task-1",
+            json={"patch": {"status": "in_progress", "progress": 50}},
+        )
+
+    def test_progress_zero_is_a_real_patch_value(self, fake_request):
+        server.task_update("eurorack-choir", "task-1", progress=0)
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"]["patch"] == {"progress": 0}
+
+    def test_empty_patch_raises_before_any_call(self, fake_request):
+        with pytest.raises(HyperVaultError, match="Nothing to update"):
+            server.task_update("eurorack-choir", "task-1")
+        fake_request.assert_not_called()
+
+    def test_full_patch_with_actor_and_version(self, fake_request):
+        server.task_update(
+            "eurorack-choir",
+            "task-1",
+            status="review",
+            progress=90,
+            note="pushed a fix",
+            title="Bring up I2S clocking",
+            description="details",
+            priority="critical",
+            active_form="Bringing up I2S clocking",
+            parent="epic-1",
+            metadata={"externalId": "todo-9"},
+            expected_version=11,
+            agent_name="claude-code:session-abc",
+            agent_type="claude-code",
+        )
+        fake_request.assert_called_once_with(
+            "PATCH",
+            "/api/tasklists/eurorack-choir/tasks/task-1",
+            json={
+                "patch": {
+                    "status": "review",
+                    "progress": 90,
+                    "note": "pushed a fix",
+                    "title": "Bring up I2S clocking",
+                    "description": "details",
+                    "priority": "critical",
+                    "activeForm": "Bringing up I2S clocking",
+                    "parent": "epic-1",
+                    "metadata": {"externalId": "todo-9"},
+                },
+                "expected_version": 11,
+                "actor": {"name": "claude-code:session-abc", "agentType": "claude-code"},
+            },
+        )
+
+    def test_empty_task_id_raises_before_any_call(self, fake_request):
+        with pytest.raises(HyperVaultError):
+            server.task_update("eurorack-choir", "  ", status="done")
+        fake_request.assert_not_called()
+
+    def test_conflict_payload_is_returned_not_raised(self, monkeypatch):
+        conflict = {"conflict": True, "error": "stale", "latest": {"version": 12, "tasks": []}}
+        monkeypatch.setattr(server, "_request", MagicMock(return_value=conflict))
+        assert server.task_update("p", "task-1", progress=10) == conflict
+
+
+class TestTaskClaim:
+    def test_minimal_claim(self, fake_request):
+        server.task_claim("eurorack-choir", "task-1", agent_name="claude-code:abc")
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/tasklists/eurorack-choir/tasks/task-1/claim",
+            json={"actor": {"name": "claude-code:abc"}},
+        )
+
+    def test_full_claim(self, fake_request):
+        server.task_claim(
+            "eurorack-choir",
+            "task-1",
+            agent_name="claude-code:abc",
+            agent_type="claude-code",
+            force=True,
+            release=True,
+            lock_minutes=120,
+            expected_version=3,
+        )
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/tasklists/eurorack-choir/tasks/task-1/claim",
+            json={
+                "actor": {"name": "claude-code:abc", "agentType": "claude-code"},
+                "force": True,
+                "release": True,
+                "lock_minutes": 120,
+                "expected_version": 3,
+            },
+        )
+
+    def test_false_flags_are_omitted(self, fake_request):
+        server.task_claim("eurorack-choir", "task-1", agent_name="a", force=False, release=False)
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert "force" not in kwargs["json"]
+        assert "release" not in kwargs["json"]
+
+    def test_blank_agent_name_raises_before_any_call(self, fake_request):
+        with pytest.raises(HyperVaultError, match="agent_name"):
+            server.task_claim("eurorack-choir", "task-1", agent_name="   ")
+        fake_request.assert_not_called()
+
+
+class TestTaskComplete:
+    def test_minimal_complete(self, fake_request):
+        server.task_complete("eurorack-choir", "task-1")
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/tasklists/eurorack-choir/tasks/task-1/complete",
+            json={},
+        )
+
+    def test_full_complete(self, fake_request):
+        server.task_complete(
+            "eurorack-choir",
+            "task-1",
+            note="landed in PR #12",
+            expected_version=9,
+            agent_name="claude-code:abc",
+            agent_type="claude-code",
+        )
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/tasklists/eurorack-choir/tasks/task-1/complete",
+            json={
+                "note": "landed in PR #12",
+                "expected_version": 9,
+                "actor": {"name": "claude-code:abc", "agentType": "claude-code"},
+            },
+        )

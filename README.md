@@ -47,6 +47,14 @@ Authentication differs by transport — see [Auth & rate limits](#auth--rate-lim
 | `recall(query)` | Natural-language search over the wiki ("what did I say about the Rust borrow checker?"). Top matches return the exact stored content; every match lists its linked memories. |
 | `list_memories()` | Browses everything memorized, newest first (summaries + tags). |
 | `forget_memory(memory_id)` | Permanently deletes one memory — only on the user's explicit request. |
+| `create_task_board(title, project, tasks, stages, visibility)` | Creates a **universal task board** — a shared, versioned task list — plus the interactive board page the user watches it on. Returns `project` (what every other task tool takes) and `board.url` (the human deliverable). See [Universal task boards](#universal-task-boards-shared-work-lists) below. |
+| `list_task_boards()` | Lists the user's existing boards, so you can join one instead of creating a duplicate. |
+| `tasklist_get(project, since_version=None)` | Reads the full list. With `since_version` you get `{unchanged: true, version}` when nothing moved — the cheap poll. |
+| `tasklist_summary(project)` | Rollup only: counts, progress, epics, who holds what. Prefer it over the full list for status reporting on a large board. |
+| `task_create(project, title, type, parent, description, priority, active_form, depends_on, metadata, expected_version, agent_name, agent_type)` | Adds a task to an existing board. |
+| `task_update(project, task_id, status, progress, note, title, description, priority, active_form, parent, metadata, expected_version, agent_name, agent_type)` | Patches one task; only the arguments you pass change. `note` **appends** to the task's thread, `metadata` **merges** key-wise. |
+| `task_claim(project, task_id, agent_name, agent_type, force, release, lock_minutes, expected_version)` | Claims a task — lock + assign + `in_progress` — so several agents can share a board without colliding. `release=True` hands it back. |
+| `task_complete(project, task_id, note, expected_version, agent_name, agent_type)` | Done, progress 100, lock released, in one call. The response includes the list `summary`. |
 
 Plus the `hypervault://help` resource with agent-facing usage notes.
 
@@ -110,6 +118,61 @@ the backend:
 - Paths must be unique (case-insensitively).
 - The root `index.html` can't be removed with `remove_artifact_group_item` —
   edit its content instead, or delete the whole group.
+
+### Universal task boards (shared work lists)
+
+A task board is a shared, versioned task list that an agent and the user work
+from together. One call creates both halves: a JSON data artifact
+(`tasks-{project}`) the agent syncs through, and an interactive board page
+(`taskboard-{project}`) the user opens to watch and steer the work live. Every
+write is an artifact version (audit trail + rollback), writes are
+optimistic-concurrency-safe, and claims are locks, so several agents can share
+one board without collisions.
+
+```python
+board = create_task_board(
+    title="Eurorack choir firmware",
+    tasks=[
+        {"id": "epic-1", "title": "Firmware", "type": "epic"},
+        {"title": "Bring up I2S clocking", "parent": "epic-1", "priority": "high"},
+    ],
+)
+project = board["project"]
+board["board"]["url"]        # <- hand this to the user; it's the living UI
+
+tasks = tasklist_get(project)["tasklist"]["tasks"]
+task_claim(project, tasks[1]["id"], agent_name="claude-code:session-abc")
+task_update(project, tasks[1]["id"], progress=50, note="I2S clock locked at 48 kHz")
+task_complete(project, tasks[1]["id"], note="landed in PR #12")
+
+tasklist_get(project, since_version=12)   # -> {"unchanged": true, ...} when nothing moved
+tasklist_summary(project)                 # -> counts, progress, epics, claims
+```
+
+The protocol agents should follow (it's also spelled out in
+`hypervault://help`, so a connected agent reads it without being told):
+
+- **Read at session start**, and re-poll with `since_version` at tool
+  boundaries — that's how the user's steering from the board page reaches you
+  mid-task.
+- **Claim deliberately.** Prefer tasks assigned to you or unassigned. A live
+  foreign lock fails with a 409 naming the holder; `force` is only for a holder
+  who is clearly gone (expired locks need no force). Locks last 60 minutes by
+  default, 24 h max, and re-claiming your own task renews it.
+- **Push every meaningful change immediately** — the user's board polls the
+  same list, and a stale board means they're steering blind.
+- **Send `expected_version` on writes.** A version conflict comes back as
+  `{conflict: true, latest, error}` — and `latest` is the *whole fresh list*, so
+  the tools return that payload rather than collapsing it into an error
+  message. Re-apply your change on top of `latest`; don't overwrite.
+- **Map both ways via `metadata.externalId`** to keep a native todo list and
+  the board in sync.
+
+Statuses are `todo | in_progress | blocked | review | done | cancelled`;
+priorities are `low | medium | high | critical`. Marking a task done (either
+tool) releases the lock, and a done task can't be re-claimed. Task writes
+return the whole list for convenience — on a large board that's token-heavy, so
+reach for `tasklist_summary` and `since_version` polling instead.
 
 ## Claude Desktop / Claude Code config
 
@@ -197,7 +260,9 @@ pytest
 
 The suite (`tests/`) covers the request-shaping logic of every tool, the
 `_client`/`_request` HTTP layer (mocked with `respx` — no real network
-calls), the `extract_source_prompt` preferred/legacy fallback chain, and —
+calls), the `extract_source_prompt` preferred/legacy fallback chain, the task-board
+tools (body shaping, the empty-patch and blank-`agent_name` guards, and the
+409 conflict payload coming back intact instead of as an exception), and —
 most importantly — the per-request auth model: header parsing, the
 STDIO-vs-HTTP key resolution split, and full end-to-end requests against the
 real ASGI app proving an unauthenticated `tools/call` is rejected even when
@@ -223,6 +288,36 @@ async def go():
             "title": "MCP smoke test",
         })
         print(result)
+
+asyncio.run(go())
+PY
+```
+
+Task boards need a backend running hypervault ≥ [PR #128](https://github.com/johnnyclem/hypervault/pull/128):
+
+```bash
+python - <<'PY'
+from fastmcp import Client
+from hypervault_mcp.server import mcp
+import asyncio
+
+async def go():
+    async with Client(mcp) as c:
+        board = (await c.call_tool("create_task_board", {
+            "title": "MCP smoke", "tasks": [
+                {"id": "epic-1", "title": "Epic", "type": "epic"},
+                {"title": "Child task", "parent": "epic-1"},
+            ]})).data
+        p = board["project"]                          # board["board"]["url"] is the human page
+        lst = (await c.call_tool("tasklist_get", {"project": p})).data["tasklist"]
+        tid = next(t["id"] for t in lst["tasks"] if t["parent"] == "epic-1")
+        await c.call_tool("task_claim", {"project": p, "task_id": tid, "agent_name": "smoke-test"})
+        await c.call_tool("task_update", {"project": p, "task_id": tid, "progress": 50, "note": "halfway"})
+        done = (await c.call_tool("task_complete", {"project": p, "task_id": tid, "note": "done"})).data
+        assert done["summary"]["byStatus"]["done"] == 1
+        assert (await c.call_tool("tasklist_get", {"project": p,
+            "since_version": done["summary"]["version"]})).data["unchanged"] is True
+        print("task board:", board["board"]["url"])
 
 asyncio.run(go())
 PY
