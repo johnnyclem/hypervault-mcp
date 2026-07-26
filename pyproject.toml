@@ -1,7 +1,7 @@
 [project]
 name = "hypervault-mcp"
-version = "0.2.0"
-description = "HyperVault MCP server — let agents save artifacts, claim vanity domains, and use the user's private memory wiki."
+version = "0.3.0"
+description = "HyperVault MCP server — let agents save artifacts, claim vanity domains, use the user's private memory wiki, and work shared task boards."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -110,3 +110,31 @@ class TestRequest:
         # network call here, this test would hang or hit the real network.
         with pytest.raises(HyperVaultError, match="HYPERVAULT_API_KEY is not set"):
             _request("GET", "/api/artifacts")
+
+    @respx.mock
+    def test_task_version_conflict_is_returned_with_the_latest_list(self, stdio_key):
+        # A 409 with conflict: true carries the entire fresh list under
+        # `latest` — the caller needs it to re-apply, so it must not be
+        # collapsed into an exception message.
+        body = {
+            "error": "Task list changed since version 4.",
+            "conflict": True,
+            "latest": {"version": 5, "tasks": [{"id": "task-1", "status": "done"}]},
+        }
+        respx.patch(f"{DEFAULT_API_URL}/api/tasklists/choir/tasks/task-1").mock(
+            return_value=httpx.Response(409, json=body)
+        )
+        result = _request(
+            "PATCH", "/api/tasklists/choir/tasks/task-1", json={"patch": {"progress": 50}}
+        )
+        assert result == body
+
+    @respx.mock
+    def test_conflict_without_the_flag_still_raises(self, stdio_key):
+        # An ordinary 409 (e.g. a live foreign lock on claim) is a plain
+        # error, not a version conflict to re-apply.
+        respx.post(f"{DEFAULT_API_URL}/api/tasklists/choir/tasks/task-1/claim").mock(
+            return_value=httpx.Response(409, json={"error": "Held by agent-7f2a until 12:40."})
+        )
+        with pytest.raises(HyperVaultError, match="Held by agent-7f2a"):
+            _request("POST", "/api/tasklists/choir/tasks/task-1/claim", json={})

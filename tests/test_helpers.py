@@ -9,10 +9,14 @@ from hypervault_mcp.server import (
     GROUP_MAX_FILES,
     GROUP_MAX_TOTAL_BYTES,
     HyperVaultError,
+    _actor,
     _artifact_group_slug,
     _artifact_slug,
     _find_source_prompt_meta,
     _normalize_group_files,
+    _task_id,
+    _task_write_body,
+    _tasklist_project,
     _validate_group_item_content,
     _validate_group_item_path,
 )
@@ -336,3 +340,115 @@ class TestNormalizeGroupFiles:
         assert sum(len(f["content"]) for f in files) > GROUP_MAX_TOTAL_BYTES
         with pytest.raises(HyperVaultError, match="byte limit"):
             _normalize_group_files(files)
+
+
+class TestTasklistProject:
+    def test_bare_project_id(self):
+        assert _tasklist_project("eurorack-choir") == "eurorack-choir"
+
+    def test_data_slug(self):
+        assert _tasklist_project("tasks-eurorack-choir") == "tasks-eurorack-choir"
+
+    def test_strips_whitespace(self):
+        assert _tasklist_project("  eurorack-choir  ") == "eurorack-choir"
+
+    def test_full_url(self):
+        assert (
+            _tasklist_project("https://hypervault.store/a/tasks-eurorack-choir")
+            == "tasks-eurorack-choir"
+        )
+
+    def test_vanity_subdomain_url(self):
+        assert (
+            _tasklist_project("https://nova.vault.cool/a/tasks-eurorack-choir")
+            == "tasks-eurorack-choir"
+        )
+
+    def test_url_with_query_and_fragment(self):
+        assert (
+            _tasklist_project("https://hypervault.store/a/tasks-choir?v=3#top")
+            == "tasks-choir"
+        )
+
+    def test_empty_raises(self):
+        with pytest.raises(HyperVaultError):
+            _tasklist_project("")
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(HyperVaultError):
+            _tasklist_project("   ")
+
+    def test_none_like_raises(self):
+        with pytest.raises(HyperVaultError):
+            _tasklist_project(None)  # type: ignore[arg-type]
+
+    def test_unusable_url_raises(self):
+        with pytest.raises(HyperVaultError):
+            _tasklist_project("https://hypervault.store/vault/tasks")
+
+    def test_stray_slash_raises(self):
+        # A path segment with a slash would silently break the request URL.
+        with pytest.raises(HyperVaultError):
+            _tasklist_project("tasklists/eurorack-choir")
+
+
+class TestTaskId:
+    def test_trims(self):
+        assert _task_id("  task-1  ") == "task-1"
+
+    def test_empty_raises(self):
+        with pytest.raises(HyperVaultError):
+            _task_id("")
+
+    def test_whitespace_only_raises(self):
+        with pytest.raises(HyperVaultError):
+            _task_id("   ")
+
+    def test_none_like_raises(self):
+        with pytest.raises(HyperVaultError):
+            _task_id(None)  # type: ignore[arg-type]
+
+
+class TestActor:
+    def test_none_when_nothing_given(self):
+        assert _actor(None, None) is None
+
+    def test_none_when_both_blank(self):
+        assert _actor("  ", "") is None
+
+    def test_name_only(self):
+        assert _actor("claude-code:abc", None) == {"name": "claude-code:abc"}
+
+    def test_name_and_type(self):
+        assert _actor("claude-code:abc", "claude-code") == {
+            "name": "claude-code:abc",
+            "agentType": "claude-code",
+        }
+
+    def test_trims_both(self):
+        assert _actor(" a ", " b ") == {"name": "a", "agentType": "b"}
+
+    def test_type_only_still_produces_an_actor(self):
+        assert _actor(None, "claude-code") == {"agentType": "claude-code"}
+
+
+class TestTaskWriteBody:
+    def test_omits_both_optionals(self):
+        assert _task_write_body({"patch": {"progress": 1}}, None, None, None) == {
+            "patch": {"progress": 1}
+        }
+
+    def test_adds_expected_version_and_actor(self):
+        assert _task_write_body({"patch": {}}, 7, "a", "b") == {
+            "patch": {},
+            "expected_version": 7,
+            "actor": {"name": "a", "agentType": "b"},
+        }
+
+    def test_expected_version_zero_is_kept(self):
+        assert _task_write_body({}, 0, None, None) == {"expected_version": 0}
+
+    def test_does_not_mutate_the_caller_payload(self):
+        payload = {"patch": {"progress": 1}}
+        _task_write_body(payload, 3, "a", None)
+        assert payload == {"patch": {"progress": 1}}
