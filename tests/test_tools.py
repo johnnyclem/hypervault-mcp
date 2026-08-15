@@ -506,6 +506,14 @@ class TestForgetMemory:
             server.forget_memory("   ")
         fake_request.assert_not_called()
 
+    def test_path_traversal_id_raises(self, fake_request):
+        # memory_id is interpolated straight into the request path — a
+        # value like this would otherwise redirect the DELETE call onto a
+        # different backend endpoint, still carrying the caller's own key.
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            server.forget_memory("../artifacts")
+        fake_request.assert_not_called()
+
 
 class TestEditMemory:
     def test_edits_fields(self, fake_request):
@@ -519,6 +527,11 @@ class TestEditMemory:
     def test_blank_id_raises(self, fake_request):
         with pytest.raises(HyperVaultError, match="Pass the memory id to edit"):
             server.edit_memory("   ")
+        fake_request.assert_not_called()
+
+    def test_path_traversal_id_raises(self, fake_request):
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            server.edit_memory("../artifacts")
         fake_request.assert_not_called()
 
 
@@ -538,6 +551,11 @@ class TestMemoryHistory:
     def test_blank_id_raises(self, fake_request):
         with pytest.raises(HyperVaultError, match="Pass the memory id whose history"):
             server.memory_history("   ")
+        fake_request.assert_not_called()
+
+    def test_path_traversal_id_raises(self, fake_request):
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            server.memory_history("../artifacts")
         fake_request.assert_not_called()
 
 

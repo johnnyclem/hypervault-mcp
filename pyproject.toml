@@ -6,7 +6,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
-    "fastmcp>=2.0.0",
+    # <2.12 fails to import: this code uses fastmcp.server.dependencies
+    # (get_http_headers/get_http_request, added in 2.12) and
+    # FastMCP.http_app(stateless_http=..., json_response=...), neither of
+    # which exists on fastmcp 2.0-2.11 — confirmed by installing several
+    # versions in that range against a clean environment.
+    "fastmcp>=2.12.0",
     "httpx>=0.27.0",
 ]
 

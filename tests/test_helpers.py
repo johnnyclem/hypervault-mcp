@@ -19,6 +19,7 @@ from hypervault_mcp.server import (
     _tasklist_project,
     _validate_group_item_content,
     _validate_group_item_path,
+    _validate_ref_segment,
 )
 
 
@@ -60,6 +61,17 @@ class TestArtifactSlug:
     def test_stray_slash_without_protocol_raises(self):
         with pytest.raises(HyperVaultError):
             _artifact_slug("vault/my-game-x7k2p9")
+
+    def test_bare_dot_dot_raises(self):
+        # httpx normalizes '..' path segments client-side, so an unvalidated
+        # ".." slug would silently redirect the request to a different
+        # backend endpoint (e.g. /api/artifacts/../x -> /api/x).
+        with pytest.raises(HyperVaultError):
+            _artifact_slug("..")
+
+    def test_dot_dot_extracted_from_url_raises(self):
+        with pytest.raises(HyperVaultError):
+            _artifact_slug("https://hypervault.store/a/..")
 
 
 class TestFindSourcePromptMeta:
@@ -143,6 +155,10 @@ class TestArtifactGroupSlug:
     def test_stray_slash_without_protocol_raises(self):
         with pytest.raises(HyperVaultError):
             _artifact_group_slug("vault/my-app-x7k2p9")
+
+    def test_bare_dot_dot_raises(self):
+        with pytest.raises(HyperVaultError):
+            _artifact_group_slug("..")
 
 
 class TestValidateGroupItemPath:
@@ -391,6 +407,10 @@ class TestTasklistProject:
         with pytest.raises(HyperVaultError):
             _tasklist_project("tasklists/eurorack-choir")
 
+    def test_bare_dot_dot_raises(self):
+        with pytest.raises(HyperVaultError):
+            _tasklist_project("..")
+
 
 class TestTaskId:
     def test_trims(self):
@@ -407,6 +427,35 @@ class TestTaskId:
     def test_none_like_raises(self):
         with pytest.raises(HyperVaultError):
             _task_id(None)  # type: ignore[arg-type]
+
+    def test_embedded_slash_raises(self):
+        with pytest.raises(HyperVaultError):
+            _task_id("epic-1/../other-project")
+
+    def test_bare_dot_dot_raises(self):
+        with pytest.raises(HyperVaultError):
+            _task_id("..")
+
+
+class TestValidateRefSegment:
+    def test_returns_plain_value(self):
+        assert _validate_ref_segment("my-slug-x7k2p9", "slug") == "my-slug-x7k2p9"
+
+    def test_rejects_embedded_slash(self):
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            _validate_ref_segment("a/b", "slug")
+
+    def test_rejects_embedded_backslash(self):
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            _validate_ref_segment("a\\b", "slug")
+
+    def test_rejects_bare_dot_dot(self):
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            _validate_ref_segment("..", "slug")
+
+    def test_rejects_bare_dot(self):
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            _validate_ref_segment(".", "slug")
 
 
 class TestActor:
