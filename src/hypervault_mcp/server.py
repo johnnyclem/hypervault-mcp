@@ -33,8 +33,10 @@ from __future__ import annotations
 
 import argparse
 import html as html_module
+import ipaddress
 import os
 import re
+import socket
 from typing import Any
 
 import httpx
@@ -189,6 +191,21 @@ def _request(
     return payload
 
 
+def _validate_ref_segment(value: str, what: str) -> str:
+    """Guard a value that is about to be interpolated directly into a URL
+    path segment.
+
+    httpx normalizes '..'/'.' segments client-side (e.g. "/api/x/../y"
+    becomes "/api/y"), so an unvalidated id/slug could silently redirect a
+    request onto a different backend endpoint while still carrying the
+    caller's own forwarded credentials. Rejects embedded path separators and
+    bare dot segments. Assumes `value` is already known to be non-empty.
+    """
+    if "/" in value or "\\" in value or value in (".", ".."):
+        raise HyperVaultError(f"{what.capitalize()} {value!r} is not a valid reference.")
+    return value
+
+
 def _artifact_slug(ref: str) -> str:
     """Resolve an artifact reference to its slug.
 
@@ -201,14 +218,14 @@ def _artifact_slug(ref: str) -> str:
         raise HyperVaultError("Pass the artifact's slug or URL.")
     match = re.search(r"/a/([^/?#]+)", cleaned)
     if match:
-        return match.group(1)
+        return _validate_ref_segment(match.group(1), "artifact slug")
     # Not a URL — treat it as a bare slug, but reject a stray protocol/host.
     if "://" in cleaned or "/" in cleaned:
         raise HyperVaultError(
             "Could not find an artifact slug in that reference — pass a slug like "
             "'my-game-x7k2p9' or a full URL like https://hypervault.store/a/my-game-x7k2p9."
         )
-    return cleaned
+    return _validate_ref_segment(cleaned, "artifact slug")
 
 
 def _artifact_group_slug(ref: str) -> str:
@@ -223,13 +240,13 @@ def _artifact_group_slug(ref: str) -> str:
         raise HyperVaultError("Pass the artifact group's slug or URL.")
     match = re.search(r"/g/([^/?#]+)", cleaned)
     if match:
-        return match.group(1)
+        return _validate_ref_segment(match.group(1), "artifact-group slug")
     if "://" in cleaned or "/" in cleaned:
         raise HyperVaultError(
             "Could not find an artifact-group slug in that reference — pass a slug like "
             "'my-app-x7k2p9' or a full URL like https://hypervault.store/g/my-app-x7k2p9."
         )
-    return cleaned
+    return _validate_ref_segment(cleaned, "artifact-group slug")
 
 
 def _validate_group_item_path(path: Any) -> str:
@@ -916,6 +933,7 @@ def forget_memory(memory_id: str, branch: str | None = None) -> dict[str, Any]:
     memory_id = memory_id.strip()
     if not memory_id:
         raise HyperVaultError("Pass the memory id to forget (see list_memories or recall).")
+    memory_id = _validate_ref_segment(memory_id, "memory id")
     return _request(
         "DELETE",
         f"/api/memories/{memory_id}",
@@ -953,6 +971,7 @@ def edit_memory(
     memory_id = memory_id.strip()
     if not memory_id:
         raise HyperVaultError("Pass the memory id to edit.")
+    memory_id = _validate_ref_segment(memory_id, "memory id")
     return _request(
         "PATCH",
         f"/api/memories/{memory_id}",
@@ -981,6 +1000,7 @@ def memory_history(memory_id: str, full: bool = False, limit: int = 50) -> dict[
     memory_id = memory_id.strip()
     if not memory_id:
         raise HyperVaultError("Pass the memory id whose history you want.")
+    memory_id = _validate_ref_segment(memory_id, "memory id")
     params: dict[str, Any] = {"limit": limit}
     if full:
         params["full"] = "1"
@@ -1157,14 +1177,14 @@ def _tasklist_project(project: str) -> str:
         )
     match = re.search(r"/a/([^/?#]+)", cleaned)
     if match:
-        return match.group(1)
+        return _validate_ref_segment(match.group(1), "task-board reference")
     if "://" in cleaned or "/" in cleaned:
         raise HyperVaultError(
             "Could not find a task board in that reference — pass a project id like "
             "'eurorack-choir', a data slug like 'tasks-eurorack-choir', or a full URL like "
             "https://hypervault.store/a/tasks-eurorack-choir."
         )
-    return cleaned
+    return _validate_ref_segment(cleaned, "task-board reference")
 
 
 def _task_id(task_id: str) -> str:
@@ -1172,7 +1192,7 @@ def _task_id(task_id: str) -> str:
     cleaned = (task_id or "").strip()
     if not cleaned:
         raise HyperVaultError("Pass the task's id (see tasklist_get for the current list).")
-    return cleaned
+    return _validate_ref_segment(cleaned, "task id")
 
 
 def _actor(agent_name: str | None, agent_type: str | None) -> dict[str, str] | None:
@@ -1579,6 +1599,52 @@ def _find_source_prompt_meta(page_html: str) -> str | None:
     return None
 
 
+def _assert_public_host(request: httpx.Request) -> None:
+    """Refuse to fetch a request whose host resolves to a non-public
+    address (loopback, private, link-local, or otherwise reserved).
+
+    Used as an httpx request event hook so it runs before the initial
+    request *and* before every redirect hop the client follows — a host
+    that resolves publicly on the first request could still redirect to an
+    internal address, and event hooks are the only point that sees each hop.
+    This is defense-in-depth for extract_source_prompt's legacy fetch path,
+    which otherwise fetches whatever URL the caller passes in.
+    """
+    host = request.url.host
+    if not host:
+        raise HyperVaultError("Artifact URL has no host.")
+    try:
+        addrs = {info[4][0] for info in socket.getaddrinfo(host, None)}
+    except socket.gaierror as exc:
+        raise HyperVaultError(f"Could not resolve host {host!r}: {exc}") from exc
+    for addr in addrs:
+        ip = ipaddress.ip_address(addr)
+        if (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_reserved
+            or ip.is_multicast
+            or ip.is_unspecified
+        ):
+            raise HyperVaultError(
+                f"Refusing to fetch {host!r} — it resolves to a non-public address."
+            )
+
+
+def _fetch_legacy_artifact_page(url: str) -> httpx.Response:
+    """Fetch a caller-supplied artifact URL directly, with no API key
+    attached (the page is public). Every hop — the initial request and each
+    redirect — is checked against private/internal address ranges via
+    _assert_public_host before it is sent."""
+    with httpx.Client(
+        follow_redirects=True,
+        timeout=30.0,
+        event_hooks={"request": [_assert_public_host]},
+    ) as client:
+        return client.get(url)
+
+
 @mcp.tool
 def extract_source_prompt(url: str) -> dict[str, Any]:
     """Extract the original source prompt from a HyperVault artifact URL.
@@ -1615,9 +1681,11 @@ def extract_source_prompt(url: str) -> dict[str, Any]:
         pass
 
     # Legacy path: artifact pages are public — fetched without the API key so
-    # the key is never sent to arbitrary hosts (vanity domains included).
+    # the key is never sent to arbitrary hosts (vanity domains included). The
+    # host is caller-controlled, so every hop (initial request and each
+    # redirect) is checked against private/internal address ranges first.
     try:
-        response = httpx.get(cleaned, follow_redirects=True, timeout=30.0)
+        response = _fetch_legacy_artifact_page(cleaned)
         response.raise_for_status()
     except httpx.HTTPError as exc:
         raise HyperVaultError(
