@@ -442,8 +442,10 @@ def read_artifact(ref: str, version: str | None = None) -> dict[str, Any]:
     Returns:
         dict with `slug`, `title`, `content` (the editable source), `is_jsx`,
         `mutable` (whether it's a living document you can write to), the
-        `content_hash`, and `version` (the commit this content came from, or
-        null if the artifact has no recorded history).
+        `content_hash`, `version` (the commit this content came from, or
+        null if the artifact has no recorded history) and `head_version_id`
+        — pass that as base_version_id to write_artifact so your edit is
+        committed on top of what you read.
     """
     slug = _artifact_slug(ref)
     params = {"version": version.strip()} if version and version.strip() else None
@@ -457,6 +459,9 @@ def write_artifact(
     title: str | None = None,
     message: str | None = None,
     force_html: bool = False,
+    base_version_id: str | None = None,
+    requested_at: str | None = None,
+    author: str | None = None,
 ) -> dict[str, Any]:
     """Write a new iteration of a *mutable* artifact — a git commit on the
     living document.
@@ -470,7 +475,10 @@ def write_artifact(
     is a no-op (returns `unchanged: true`, no new commit).
 
     Typical loop: read_artifact(ref) → modify the returned content →
-    write_artifact(ref, new_content, message="what changed").
+    write_artifact(ref, new_content, message="what changed",
+    base_version_id=<the head_version_id you read>). Several agents can work
+    the same artifact this way: each commit is rebased onto whatever landed
+    before it, and only a real overlap is refused.
 
     Args:
         ref: The artifact's slug or full URL.
@@ -481,25 +489,51 @@ def write_artifact(
             "edit"). It shows up in artifact_history.
         force_html: Pass true to store the content as plain HTML even if it
             looks like JSX (skips auto-wrapping).
+        base_version_id: The `version.id` / `head_version_id` you got from
+            read_artifact — the commit you built on. With it, the write is
+            applied like a git commit: if the head is still your base it
+            fast-forwards; if another agent committed first, your change
+            (base → content) is replayed onto the new head. A clean replay
+            commits (`rebased: true`); a conflicting one returns
+            `conflict: true` with the message "Cannot apply update … pull
+            the latest version of the artifact and rebase locally first" —
+            re-read the artifact, redo your edit on the new head, and write
+            again with the new head as base_version_id. Always pass this
+            when other agents may be editing the same artifact.
+        requested_at: Optional ISO 8601 timestamp of when you decided to
+            write (defaults to now). Colliding writes are queued by this,
+            earliest first, and it's recorded as the commit's author date.
+        author: Optional agent identity ("grok", "gemini", "claude") recorded
+            on the commit for provenance in artifact_history.
 
     Returns:
         dict with `url`, `slug`, `is_jsx`, `unchanged` (true when the content
-        matched the current version), the `version` this write recorded (id,
-        message, created_at), and a human-readable `message`.
+        matched the current version), `rebased` (true when the server replayed
+        your change onto a newer head), the `version` this write recorded (id,
+        parent_version_id, message, created_at, authored_at, author_name),
+        `head_version_id` (pass it as base_version_id next time) and a
+        human-readable `message`. On a merge conflict the dict instead has
+        `conflict: true`, `reason`, `error`, `base_version_id` and the current
+        `head` — no write happened.
     """
     slug = _artifact_slug(ref)
     if not content or not content.strip():
         raise HyperVaultError("Pass the new content to write.")
-    return _request(
-        "PUT",
-        f"/api/artifacts/{slug}/content",
-        json={
-            "content": content,
-            "title": title,
-            "message": message,
-            "force_html": force_html,
-        },
-    )
+    body: dict[str, Any] = {
+        "content": content,
+        "title": title,
+        "message": message,
+        "force_html": force_html,
+    }
+    if base_version_id and base_version_id.strip():
+        body["base_version_id"] = base_version_id.strip()
+    if requested_at and requested_at.strip():
+        body["requested_at"] = requested_at.strip()
+    if author and author.strip():
+        body["author"] = author.strip()
+    # _request hands a 409 {conflict: true, ...} payload back instead of
+    # raising, so a merge conflict reaches the agent with its head/base info.
+    return _request("PUT", f"/api/artifacts/{slug}/content", json=body)
 
 
 @mcp.tool

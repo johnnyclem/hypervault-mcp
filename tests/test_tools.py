@@ -109,6 +109,44 @@ class TestWriteArtifact:
             },
         )
 
+    def test_commit_metadata_rides_along_when_given(self, fake_request):
+        server.write_artifact(
+            "my-slug",
+            "<h1>v2</h1>",
+            base_version_id=" v-head ",
+            requested_at="2026-09-26T10:00:00Z",
+            author="grok",
+        )
+        fake_request.assert_called_once_with(
+            "PUT",
+            "/api/artifacts/my-slug/content",
+            json={
+                "content": "<h1>v2</h1>",
+                "title": None,
+                "message": None,
+                "force_html": False,
+                "base_version_id": "v-head",
+                "requested_at": "2026-09-26T10:00:00Z",
+                "author": "grok",
+            },
+        )
+
+    def test_blank_commit_metadata_is_omitted(self, fake_request):
+        server.write_artifact("my-slug", "<h1>v2</h1>", base_version_id="  ", author="")
+        body = fake_request.call_args.kwargs["json"]
+        assert "base_version_id" not in body
+        assert "author" not in body
+
+    def test_conflict_payload_is_returned_not_raised(self, fake_request):
+        conflict = {
+            "conflict": True,
+            "reason": "rebase_conflict",
+            "error": "Cannot apply update: … pull the latest version of the artifact and rebase locally first.",
+            "head": {"id": "v-9"},
+        }
+        fake_request.return_value = conflict
+        assert server.write_artifact("my-slug", "<h1>v2</h1>", base_version_id="v-1") == conflict
+
     def test_empty_content_raises_without_calling_request(self, fake_request):
         with pytest.raises(HyperVaultError, match="Pass the new content"):
             server.write_artifact("my-slug", "")
