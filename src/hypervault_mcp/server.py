@@ -437,7 +437,10 @@ def read_artifact(ref: str, version: str | None = None) -> dict[str, Any]:
             too).
         version: Optional version id (from artifact_history) to read a past
             iteration instead of the current head — useful to inspect or
-            revert to an earlier commit.
+            revert to an earlier commit. To revert, write that content back
+            with base_version_id set to the CURRENT head's id (read the
+            artifact without `version` to get it); writing it "based on" the
+            old version is a no-op rebase.
 
     Returns:
         dict with `slug`, `title`, `content` (the editable source), `is_jsx`,

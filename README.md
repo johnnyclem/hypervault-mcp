@@ -76,7 +76,9 @@ artifact_history(saved["slug"])                    # -> the commit chain, newest
 ```
 
 `read_artifact` → edit → `write_artifact` is the iteration loop; to revert, read
-an old version's content (`read_artifact(ref, version=...)`) and write it back.
+an old version's content (`read_artifact(ref, version=...)`) and write it back
+with `base_version_id` set to the current head (writing it "based on" the old
+version itself is a no-op rebase, and the API says so).
 The write tools are owner-scoped (the API key resolves to its owner), so a
 mutable artifact is read and written privately even when the page is public.
 
