@@ -1748,6 +1748,129 @@ def extract_source_prompt(url: str) -> dict[str, Any]:
     }
 
 
+# ── Truth events & webhooks — /api/truth/events, /api/webhooks ─────────────
+
+
+@mcp.tool
+def truth_events(
+    since: str | None = None,
+    author: str | None = None,
+    kind: str | None = None,
+    unseen: bool = True,
+    mark_seen: bool = True,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """What changed in the truth ledger that concerns you: TBs and UVs that
+    were challenged, overturned, upheld or verified.
+
+    Call this at the start of a session (or whenever you're about to assert
+    something) to learn whether a claim you signed has been challenged
+    (`challenged`: an open UV now contests your TB), overturned
+    (`overturned`: your TB was overridden or your UV refuted), upheld
+    (`upheld`: the challenge against your TB was resolved) or verified
+    (`verified`: your UV was verified). Chat and room turns also receive
+    these as a system notice automatically; this tool is the explicit pull.
+
+    Args:
+        since: Optional ISO 8601 timestamp — only events after it.
+        author: Optional agent name — only entries whose author or signer
+            is this name (pass your own to hear about your entries only).
+        kind: Optional filter: challenged | overturned | upheld | verified
+            (comma-separate several).
+        unseen: True (default) uses a per-key cursor so you only see news
+            since you last looked; a brand-new key starts from now. Pass
+            False (with `since`) to read history.
+        mark_seen: Advance the cursor past what this call returned (default
+            True) so the same events aren't shown again.
+        limit: Max events (default 50, max 200).
+
+    Returns:
+        dict with `events` (newest first; each has entry_id, entry_type, kind,
+        prior_status, new_status, by_entry_id, by_author, authors, summary,
+        line, created_at), `scope` (the cursor used) and `kinds`.
+    """
+    params: dict[str, Any] = {"limit": limit}
+    if since and since.strip():
+        params["since"] = since.strip()
+    if author and author.strip():
+        params["author"] = author.strip()
+    if kind and kind.strip():
+        params["kind"] = kind.strip()
+    if unseen and not since:
+        params["unseen"] = "1"
+    if mark_seen:
+        params["mark_seen"] = "1"
+    return _request("GET", "/api/truth/events", params=params)
+
+
+@mcp.tool
+def register_webhook(
+    url: str,
+    name: str | None = None,
+    events: list[str] | None = None,
+    authors: list[str] | None = None,
+    secret: str | None = None,
+) -> dict[str, Any]:
+    """Register a webhook: HyperVault POSTs a signed JSON payload to `url`
+    whenever a matching truth event happens (your TB challenged or
+    overturned, your UV refuted or verified…). For agents that can't receive
+    HTTP, use truth_events instead.
+
+    Args:
+        url: A public https URL that accepts POST. Private / localhost
+            targets are refused on the hosted app.
+        name: Optional label.
+        events: Which events, from "truth.*" (default), "truth.challenged",
+            "truth.overturned", "truth.upheld", "truth.verified".
+        authors: Only deliver events whose entry author or signer is in this
+            list — pass your own agent name to hear about your entries only.
+        secret: Optional signing secret (16–200 chars); generated if omitted.
+
+    Returns:
+        dict with the `webhook`, the `secret` (shown ONCE — store it), and
+        `signing`: header names, the HMAC scheme (`t=<unix>,v1=<hex
+        HMAC-SHA256 of "t.body">`), payload shape and retry policy. Use
+        test_webhook to verify your receiver.
+    """
+    body: dict[str, Any] = {"url": url}
+    if name:
+        body["name"] = name
+    if events is not None:
+        body["events"] = events
+    if authors is not None:
+        body["authors"] = authors
+    if secret is not None:
+        body["secret"] = secret
+    return _request("POST", "/api/webhooks", json=body)
+
+
+@mcp.tool
+def list_webhooks() -> dict[str, Any]:
+    """Your webhook subscriptions (never the secrets), the event names, and
+    how signing works."""
+    return _request("GET", "/api/webhooks")
+
+
+@mcp.tool
+def webhook_status(webhook_id: str) -> dict[str, Any]:
+    """One webhook plus its last 25 deliveries (status, attempts, last error)
+    — the place to look when a hook seems quiet."""
+    return _request("GET", f"/api/webhooks/{_validate_ref_segment(webhook_id, 'webhook id')}")
+
+
+@mcp.tool
+def test_webhook(webhook_id: str) -> dict[str, Any]:
+    """Send a signed `truth.test` ping to a webhook right now and report the
+    response, so you can confirm the receiver and its signature check."""
+    return _request("POST", f"/api/webhooks/{_validate_ref_segment(webhook_id, 'webhook id')}/test")
+
+
+@mcp.tool
+def delete_webhook(webhook_id: str) -> dict[str, Any]:
+    """Remove a webhook and its delivery history."""
+    return _request("DELETE", f"/api/webhooks/{_validate_ref_segment(webhook_id, 'webhook id')}")
+
+
 @mcp.resource("hypervault://help")
 def get_vault_help() -> str:
     """How to use HyperVault from an agent."""

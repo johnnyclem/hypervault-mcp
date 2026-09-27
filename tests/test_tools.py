@@ -991,3 +991,46 @@ class TestTaskComplete:
                 "actor": {"name": "claude-code:abc", "agentType": "claude-code"},
             },
         )
+
+
+class TestTruthEventsAndWebhooks:
+    def test_truth_events_defaults_to_unseen_and_marks_seen(self, fake_request):
+        server.truth_events()
+        fake_request.assert_called_once_with(
+            "GET", "/api/truth/events", params={"limit": 50, "unseen": "1", "mark_seen": "1"}
+        )
+
+    def test_truth_events_with_since_reads_history_without_the_cursor(self, fake_request):
+        server.truth_events(since="2026-09-27T00:00:00Z", author=" grok ", kind="challenged,overturned", mark_seen=False)
+        params = fake_request.call_args.kwargs["params"]
+        assert params == {
+            "limit": 50,
+            "since": "2026-09-27T00:00:00Z",
+            "author": "grok",
+            "kind": "challenged,overturned",
+        }
+
+    def test_register_webhook_sends_only_given_fields(self, fake_request):
+        server.register_webhook("https://hooks.example.com/x", authors=["grok"])
+        fake_request.assert_called_once_with(
+            "POST", "/api/webhooks", json={"url": "https://hooks.example.com/x", "authors": ["grok"]}
+        )
+
+    def test_webhook_management_paths(self, fake_request):
+        server.list_webhooks()
+        server.webhook_status("wh-1")
+        server.test_webhook("wh-1")
+        server.delete_webhook("wh-1")
+        calls = [(c.args[0], c.args[1]) for c in fake_request.call_args_list]
+        assert calls == [
+            ("GET", "/api/webhooks"),
+            ("GET", "/api/webhooks/wh-1"),
+            ("POST", "/api/webhooks/wh-1/test"),
+            ("DELETE", "/api/webhooks/wh-1"),
+        ]
+
+    def test_webhook_id_is_validated_as_a_path_segment(self, fake_request):
+        with pytest.raises(HyperVaultError):
+            server.delete_webhook("../secrets")
+        fake_request.assert_not_called()
+
