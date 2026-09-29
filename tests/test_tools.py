@@ -204,6 +204,12 @@ class TestListMyVaultItems:
         fake_request.assert_called_once_with("GET", "/api/artifacts")
 
 
+class TestSetupChallenge:
+    def test_reads_this_keys_challenge(self, fake_request):
+        assert server.setup_challenge() == {"ok": True}
+        fake_request.assert_called_once_with("GET", "/api/setup-challenge")
+
+
 class TestDeleteVaultItem:
     def test_deletes_by_slug(self, fake_request):
         server.delete_vault_item("my-game-x7k2p9")

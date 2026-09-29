@@ -14,6 +14,7 @@ class TestVaultHelpResource:
             "save_to_hypervault",
             "claim_vanity_subdomain",
             "list_my_vault_items",
+            "setup_challenge",
             "connect_vault_items",
             "extract_source_prompt",
             "delete_vault_item",
@@ -65,18 +66,26 @@ class TestMainCli:
         run_mock.assert_called_once_with()
 
     def test_http_transport_wires_host_and_port(self, monkeypatch):
+        """HTTP goes through uvicorn with the keyed app, not mcp.run, so a
+        local HTTP server accepts /k/<key>/mcp like the hosted one."""
         run_mock = MagicMock()
-        monkeypatch.setattr(server.mcp, "run", run_mock)
+        built = object()
+        monkeypatch.setattr(server.mcp, "run", MagicMock())
+        monkeypatch.setattr(server, "build_http_app", MagicMock(return_value=built))
+        monkeypatch.setattr("uvicorn.run", run_mock)
         monkeypatch.setattr(
             "sys.argv",
             ["hypervault-mcp", "--transport", "http", "--host", "0.0.0.0", "--port", "9999"],
         )
         server.main()
-        run_mock.assert_called_once_with(transport="http", host="0.0.0.0", port=9999)
+        run_mock.assert_called_once_with(built, host="0.0.0.0", port=9999)
+        server.mcp.run.assert_not_called()
 
     def test_http_transport_default_host_and_port(self, monkeypatch):
         run_mock = MagicMock()
-        monkeypatch.setattr(server.mcp, "run", run_mock)
+        monkeypatch.setattr(server, "build_http_app", MagicMock(return_value="app"))
+        monkeypatch.setattr("uvicorn.run", run_mock)
         monkeypatch.setattr("sys.argv", ["hypervault-mcp", "--transport", "http"])
         server.main()
-        run_mock.assert_called_once_with(transport="http", host="127.0.0.1", port=8787)
+        run_mock.assert_called_once_with("app", host="127.0.0.1", port=8787)
+
