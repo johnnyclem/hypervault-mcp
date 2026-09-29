@@ -7,7 +7,35 @@ Built with [FastMCP](https://gofastmcp.com).
 
 **Hosted endpoint:** `https://mcp.vault.cool/mcp` (Streamable HTTP) — no
 install needed, just point your MCP client at it with your own API key. See
-[Auth & rate limits](#auth--rate-limits) for the header format.
+[Auth & rate limits](#auth--rate-limits) for the header format, or
+[Connect from the Claude app](#connect-from-the-claude-app-web-iphone-android)
+for clients that can't send headers.
+
+## Connect from the Claude app (web, iPhone, Android)
+
+The Claude app's custom connectors take a URL but no headers, so the key
+rides in the URL instead:
+
+```
+https://mcp.vault.cool/k/hv_your_key_here/mcp
+```
+
+1. claude.ai → **Settings → Connectors → Add custom connector** (custom
+   connectors need a paid plan; if the mobile app doesn't show the option,
+   add it once in a browser — connectors sync to every device).
+2. Name it **HyperVault**, paste the URL above, save, then turn it on in a
+   chat's tools menu.
+3. Say *"Complete the HyperVault setup challenge"* — the agent calls
+   `setup_challenge()` to find the key's challenge page and finishes it with
+   `read_artifact` → `write_artifact`. No key ever needs to be pasted into
+   the chat.
+
+The URL **is** the credential: anything that logs request paths (Vercel's
+function logs included) can see it. Mint a key just for the connector, and
+revoke it from the dashboard's Agent API keys panel if it leaks. When a
+request carries both a URL key and a key header, the URL wins — the URL is
+the connector's identity. The vault dashboard generates this URL for you
+when you mint a key.
 
 ## Install & run
 
@@ -31,6 +59,7 @@ Authentication differs by transport — see [Auth & rate limits](#auth--rate-lim
 | `claim_vanity_subdomain(desired_name, base_domain="vault.cool")` | Claims `name.vault.cool` for the user, effective immediately. Pro accounts can hold up to 10 subdomains; the full vault lives on every one. |
 | `connect_vault_items(source, target)` | Connects two existing artifacts (bidirectional, drawn in graph view). |
 | `list_my_vault_items()` | Lists everything already in the vault. |
+| `setup_challenge()` | Finds this key's one-time setup challenge (slug, whether it's done, the exact edit steps). Completing it with `read_artifact` → edit → `write_artifact` flips the key's dashboard badge to **Agent connected ✓**. The first call to make on a fresh key. |
 | `read_artifact(ref, version=None)` | Reads an artifact's current editable source (raw JSX for JSX artifacts, HTML otherwise) by slug or URL, plus its `head_version_id`. Pass a `version` id to read a past iteration. Pair with `write_artifact` to iterate. |
 | `write_artifact(ref, content, title, message, force_html, base_version_id, requested_at, author)` | Writes a new iteration of a **mutable** artifact — a git commit on the living document. The page updates in place (URL unchanged) and the write is kept as a version. Pass the `head_version_id` you read as `base_version_id` and the write is applied like a commit: fast-forward when nothing changed underneath, rebased onto the new head when another agent committed first, and refused with `conflict: true` ("Cannot apply update … pull the latest version of the artifact and rebase locally first") when the edits overlap. `requested_at` orders colliding writes (earliest first); `author` names the agent in history. Immutable artifacts are refused. |
 | `artifact_history(ref, full, limit)` | Lists a mutable artifact's version history (git commits), newest first, with authorship. Revert by reading an old version and writing it back. |
@@ -255,6 +284,12 @@ How the key gets there depends on the transport:
   `https://mcp.vault.cool/mcp` is a custom-domain alias for the same
   deployment as `https://hypervault-mcp.vercel.app/mcp` — the two are
   interchangeable and always serve identical code.
+
+  Clients that can't set headers use the URL form
+  `https://mcp.vault.cool/k/hv_.../mcp` instead — see
+  [Connect from the Claude app](#connect-from-the-claude-app-web-iphone-android).
+  `hypervault-mcp --transport http` serves the same `/k/<key>/mcp` route
+  locally.
 
 ## Tests
 

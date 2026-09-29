@@ -11,6 +11,7 @@ import sys
 # The package lives under ../src (src layout); make it importable.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from hypervault_mcp.server import mcp
+from hypervault_mcp.server import build_http_app
 
-app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
+# /mcp with a key header, or /k/<key>/mcp for clients that can't set headers.
+app = build_http_app(path="/mcp")

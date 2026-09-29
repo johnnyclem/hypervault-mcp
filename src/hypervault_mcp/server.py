@@ -10,8 +10,11 @@ Authentication differs by transport:
 * HTTP (the hosted deployment at https://mcp.vault.cool/mcp — a custom-domain
   alias for https://hypervault-mcp.vercel.app/mcp, shared by many callers) —
   every call must carry the *caller's own* key, sent per-request as either
-  ``Authorization: Bearer hv_...`` or ``X-HyperVault-Key: hv_...``. There is
-  no server-side fallback key for HTTP: an operator-configured
+  ``Authorization: Bearer hv_...`` or ``X-HyperVault-Key: hv_...`` — or, for
+  MCP clients that cannot set headers (the Claude app's custom connectors on
+  web, iOS and Android), embedded in the URL as ``/k/<key>/mcp``, which
+  KeyedPathMiddleware turns into the header before FastMCP sees the request.
+  There is no server-side fallback key for HTTP: an operator-configured
   HYPERVAULT_API_KEY environment variable, if set at all, is never used to
   answer someone else's request. The key is forwarded as-is to the real
   HyperVault backend (hypervault.store), which is the only place that ever
@@ -137,7 +140,9 @@ def _resolve_api_key() -> str:
                 "Authentication required. Pass your HyperVault API key "
                 f"(create one in the web dashboard's Vault → Agent API keys) "
                 f"as either '{API_KEY_HEADER}: hv_...' or "
-                "'Authorization: Bearer hv_...' on every request."
+                "'Authorization: Bearer hv_...' on every request — or, for a "
+                "client that can't set headers (a Claude app connector), put "
+                "it in the URL: /k/<key>/mcp."
             )
         return api_key
 
@@ -149,6 +154,60 @@ def _resolve_api_key() -> str:
             "the server."
         )
     return api_key
+
+
+# URL-keyed connector path: ``/k/<key>/mcp``. Only hv_ keys in the charset the
+# backend mints (base64url) are recognised, so nothing else can be smuggled
+# into the header we inject.
+_KEYED_PATH_RE = re.compile(r"^/k/(hv_[A-Za-z0-9_-]+)(/.*)$")
+
+
+class KeyedPathMiddleware:
+    """ASGI wrapper that accepts the API key as a URL segment.
+
+    The Claude app's custom connectors (claude.ai on web, iOS and Android)
+    can point at a remote MCP URL but cannot attach a header to it, so the
+    key rides in the URL instead — ``/k/<key>/mcp`` is rewritten to the
+    plain MCP path with ``X-HyperVault-Key: <key>`` injected (any caller
+    supplied key headers are replaced: the URL is the connector's identity).
+    Every other path passes through untouched, so header-authenticated
+    clients keep using ``/mcp`` exactly as before.
+
+    The trade-off is that the key is part of a URL, which request logs may
+    record. The README tells users to mint a dedicated key for a connector
+    and revoke it from the dashboard if it ever leaks.
+    """
+
+    def __init__(self, app: Any, mcp_path: str = "/mcp") -> None:
+        self.app = app
+        self.mcp_path = mcp_path
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http":
+            match = _KEYED_PATH_RE.match(scope.get("path", ""))
+            if match and match.group(2) == self.mcp_path:
+                key = match.group(1)
+                scope = dict(scope)
+                scope["path"] = self.mcp_path
+                scope["raw_path"] = self.mcp_path.encode("ascii")
+                scope["headers"] = [
+                    (name, value)
+                    for name, value in scope.get("headers", [])
+                    if name.lower() not in (b"x-hypervault-key", b"authorization")
+                ] + [(API_KEY_HEADER.lower().encode("ascii"), key.encode("ascii"))]
+        await self.app(scope, receive, send)
+
+
+def build_http_app(path: str = "/mcp") -> Any:
+    """The Streamable-HTTP ASGI app served by Vercel and ``--transport http``.
+
+    Stateless + JSON responses suit serverless (each request is
+    self-contained, no SSE session held open), wrapped so ``/k/<key>/mcp``
+    works alongside header auth on ``/mcp``.
+    """
+    return KeyedPathMiddleware(
+        mcp.http_app(path=path, stateless_http=True, json_response=True), mcp_path=path
+    )
 
 
 def _client() -> httpx.Client:
@@ -623,6 +682,27 @@ def list_my_vault_items() -> dict[str, Any]:
         is_jsx, created_at}, newest first.
     """
     return _request("GET", "/api/artifacts")
+
+
+@mcp.tool
+def setup_challenge() -> dict[str, Any]:
+    """Find this key's one-time setup challenge and how to complete it.
+
+    Minting an API key in the HyperVault dashboard also creates a private,
+    mutable challenge artifact for it. Completing it — read the page with
+    read_artifact, make the small edits it describes, write it back with
+    write_artifact — proves auth and the read/write round-trip both work,
+    and flips the key's badge to "Agent connected" in the dashboard. Call
+    this first when a user asks you to "complete the HyperVault setup" and
+    you don't already have the challenge slug.
+
+    Returns:
+        dict with `slug` (pass it to read_artifact / write_artifact),
+        `complete` (whether this key already passed), `steps` (the exact
+        edits to make) and `definition_of_done`. A 404 means this key has
+        no challenge (it predates the feature) — there is nothing to do.
+    """
+    return _request("GET", "/api/setup-challenge")
 
 
 @mcp.tool
@@ -1895,6 +1975,11 @@ def get_vault_help() -> str:
         "   immediately.\n"
         "3. list_my_vault_items()\n"
         "   See what's already saved; use connect_to to link related items.\n"
+        "   setup_challenge()\n"
+        "   First call on a new key: returns the key's one-time setup\n"
+        "   challenge (slug + edit steps). Complete it with read_artifact →\n"
+        "   edit → write_artifact to flip the dashboard badge to\n"
+        "   'Agent connected'.\n"
         "4. connect_vault_items(source, target)\n"
         "   Link two existing artifacts. Connections are bidirectional and\n"
         "   show up as edges in the vault's graph view.\n"
@@ -2069,7 +2154,11 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.transport == "http":
-        mcp.run(transport="http", host=args.host, port=args.port)
+        # Served through build_http_app (not mcp.run) so the local HTTP
+        # server accepts /k/<key>/mcp exactly like the hosted deployment.
+        import uvicorn
+
+        uvicorn.run(build_http_app(), host=args.host, port=args.port)
     else:
         mcp.run()  # stdio
 
