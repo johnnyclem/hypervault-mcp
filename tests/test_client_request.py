@@ -129,6 +129,23 @@ class TestRequest:
         )
         assert result == body
 
+    @pytest.mark.parametrize("status", [412, 428])
+    @respx.mock
+    def test_artifact_write_refusals_are_returned_with_the_head(self, stdio_key, status):
+        # A stale If-Match (412) or a write with no base (428) carries the
+        # head's content to merge against — hand it back like a 409.
+        body = {
+            "error": "Cannot apply update: say which version you edited.",
+            "conflict": True,
+            "reason": "precondition_required",
+            "head": {"id": "v-9"},
+            "head_content": "<h1>head</h1>",
+        }
+        respx.put(f"{DEFAULT_API_URL}/api/artifacts/plan/content").mock(
+            return_value=httpx.Response(status, json=body)
+        )
+        assert _request("PUT", "/api/artifacts/plan/content", json={"content": "x"}) == body
+
     @respx.mock
     def test_conflict_without_the_flag_still_raises(self, stdio_key):
         # An ordinary 409 (e.g. a live foreign lock on claim) is a plain

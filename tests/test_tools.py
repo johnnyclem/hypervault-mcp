@@ -147,6 +147,12 @@ class TestWriteArtifact:
         fake_request.return_value = conflict
         assert server.write_artifact("my-slug", "<h1>v2</h1>", base_version_id="v-1") == conflict
 
+    def test_force_is_sent_only_when_set(self, fake_request):
+        server.write_artifact("my-slug", "<h1>v2</h1>")
+        assert "force" not in fake_request.call_args.kwargs["json"]
+        server.write_artifact("my-slug", "<h1>v2</h1>", force=True)
+        assert fake_request.call_args.kwargs["json"]["force"] is True
+
     def test_empty_content_raises_without_calling_request(self, fake_request):
         with pytest.raises(HyperVaultError, match="Pass the new content"):
             server.write_artifact("my-slug", "")
