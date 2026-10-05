@@ -242,8 +242,10 @@ def _request(
         # *entire* fresh list under `latest` — exactly what the caller needs to
         # re-apply its change on top. Raising would discard it (a tool error is
         # only a message string), so hand the whole payload back instead and
-        # let the task_* docstrings tell agents to check `conflict`.
-        if response.status_code == 409 and isinstance(payload, dict) and payload.get("conflict"):
+        # let the task_* docstrings tell agents to check `conflict`. Artifact
+        # writes refuse the same way with 412 (stale If-Match) and 428 (no
+        # base_version_id), carrying the head's content to merge against.
+        if response.status_code in (409, 412, 428) and isinstance(payload, dict) and payload.get("conflict"):
             return payload
         error = payload.get("error") if isinstance(payload, dict) else None
         raise HyperVaultError(error or f"HyperVault returned HTTP {response.status_code}.")
@@ -524,6 +526,7 @@ def write_artifact(
     base_version_id: str | None = None,
     requested_at: str | None = None,
     author: str | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     """Write a new iteration of a *mutable* artifact — a git commit on the
     living document.
@@ -541,6 +544,11 @@ def write_artifact(
     base_version_id=<the head_version_id you read>). Several agents can work
     the same artifact this way: each commit is rebased onto whatever landed
     before it, and only a real overlap is refused.
+
+    base_version_id is required: a write without it is refused with
+    `conflict: true, reason: "precondition_required"` (nothing is written),
+    because a whole-document write from a stale read would silently drop every
+    commit made since. Read the artifact first and pass its head_version_id.
 
     Args:
         ref: The artifact's slug or full URL.
@@ -560,13 +568,17 @@ def write_artifact(
             `conflict: true` with the message "Cannot apply update … pull
             the latest version of the artifact and rebase locally first" —
             re-read the artifact, redo your edit on the new head, and write
-            again with the new head as base_version_id. Always pass this
-            when other agents may be editing the same artifact.
+            again with the new head as base_version_id. Required unless
+            force=True.
         requested_at: Optional ISO 8601 timestamp of when you decided to
             write (defaults to now). Colliding writes are queued by this,
             earliest first, and it's recorded as the commit's author date.
         author: Optional agent identity ("grok", "gemini", "claude") recorded
             on the commit for provenance in artifact_history.
+        force: Overwrite the head without a base_version_id (last writer
+            wins). Only for a deliberate reset — it discards whatever anyone
+            else committed since your read. The commit is marked "(forced
+            overwrite)" in history.
 
     Returns:
         dict with `url`, `slug`, `is_jsx`, `unchanged` (true when the content
@@ -574,9 +586,12 @@ def write_artifact(
         your change onto a newer head), the `version` this write recorded (id,
         parent_version_id, message, created_at, authored_at, author_name),
         `head_version_id` (pass it as base_version_id next time) and a
-        human-readable `message`. On a merge conflict the dict instead has
-        `conflict: true`, `reason`, `error`, `base_version_id` and the current
-        `head` — no write happened.
+        human-readable `message`. When the write is refused the dict instead
+        has `conflict: true`, `reason` ("rebase_conflict", "unknown_base",
+        "precondition_required", ...), `error`, `base_version_id`, the current
+        `head`, `head_content` (the head's source) and `base_content` (your
+        base's source, when known) — no write happened. Merge your change onto
+        `head_content` and write again with base_version_id = head.id.
     """
     slug = _artifact_slug(ref)
     if not content or not content.strip():
@@ -593,6 +608,8 @@ def write_artifact(
         body["requested_at"] = requested_at.strip()
     if author and author.strip():
         body["author"] = author.strip()
+    if force:
+        body["force"] = True
     # _request hands a 409 {conflict: true, ...} payload back instead of
     # raising, so a merge conflict reaches the agent with its head/base info.
     return _request("PUT", f"/api/artifacts/{slug}/content", json=body)
