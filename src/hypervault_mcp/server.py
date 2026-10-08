@@ -61,34 +61,72 @@ GROUP_MAX_FILE_BYTES = 256_000
 GROUP_MAX_TOTAL_BYTES = 1_000_000
 _GROUP_PATH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 
+# The docs read_docs may fetch: public pages on the API origin, by short name.
+# Nothing else is ever requested, whatever the caller passes in.
+DOC_PATHS = {
+    "start": "/start.md",
+    "explain": "/explain.md",
+    "connect": "/connect.md",
+    "llms": "/llms.txt",
+}
+# The spellings of those names read_docs accepts: "start", "start.md" and
+# "/start.md" all mean the same page. A lookup by exact match, not a pattern, so
+# no other string can reach a request.
+_DOC_SPELLINGS = {
+    spelling: name
+    for name, doc_path in DOC_PATHS.items()
+    for spelling in (name, doc_path.lstrip("/"), doc_path)
+}
+DOCS_PAGE_CHARS = 20_000
+
+# What `yours` can be filtered to. There is no "key": an agent learns the keys it
+# was allowed to use from my_keys, and the backend refuses it a list of keys.
+YOURS_KINDS = ("all", "memory", "file")
+
 mcp = FastMCP(
     name="HyperVault",
     instructions=(
-        "Save anything you create (HTML pages, React/JSX components, reports, "
-        "games) permanently to the user's HyperVault, and claim memorable "
-        "vanity subdomains like name.vault.cool. Every save returns a "
-        "shareable, installable URL. Artifacts are immutable by default, but "
-        "save one with mutable=true to get a living document you can rewrite: "
-        "read_artifact reads it, write_artifact commits a new iteration, and "
-        "artifact_history lists (and lets you revert) those git commits. "
+        "HyperVault keeps what the person's AI makes, as private links and "
+        "memory that only they can open. When they ask you to keep something, "
+        "call save_to_hypervault (private unless they say otherwise), say "
+        "\"Kept. Here's the link.\" and give the url exactly as the answer has "
+        "it. The whole flow is /start.md on the HyperVault site and a "
+        "one-minute way to explain HyperVault is /explain.md; if you can't "
+        "open web pages, read_docs('start') and read_docs('explain') return "
+        "the same pages. "
+        "Talk to the person in plain words: keep, memory, file, group, key, "
+        "page. Never say \"MCP\", \"grant\", \"wiki\", \"subdomain\" or \"vault "
+        "item\" to them, even where a tool's name or description still does. "
+        "To find what is already kept, yours(query) looks through their "
+        "memories, files and groups by name, and read_memory(memory_id) reads "
+        "one memory in full; recall() answers a question from their memories. "
+        "my_keys() lists, by name, the keys the person let you use. It is "
+        "names only: no tool returns a key's value. "
+        "Everything you save comes back as a shareable, installable URL. "
+        "Artifacts are immutable by default, but save one with mutable=true "
+        "to get a living document you can rewrite: read_artifact reads it, "
+        "write_artifact commits a new iteration, and artifact_history lists "
+        "(and lets you revert) those git commits. "
         "For multi-file projects, use artifact groups instead: "
         "create_artifact_group bundles several .html/.css/.js/.jsx files "
         "behind a required root index.html and returns a JSFiddle-style "
         "run/preview URL; add_artifact_group_item, edit_artifact_group_item, "
         "and remove_artifact_group_item keep editing it after creation. "
-        "HyperVault is also the user's long-term "
-        "memory: memorize() stores chunks into their private LLM-wiki and "
+        "HyperVault is also the person's long-term "
+        "memory: memorize() stores chunks into their private memory and "
         "recall() answers natural-language questions about what they've "
-        "stored — use them whenever the user says 'remember this' or asks "
-        "about something from a past session. The wiki is versioned like git "
+        "stored — use them whenever the person says 'remember this' or asks "
+        "about something from a past session. Memory is versioned like git "
         "(a 'git for a mind'): every write is a commit, and the mind_* tools "
-        "branch, merge, diff, time-travel, and revert the user's memory. "
+        "branch, merge, diff, time-travel, and revert it. "
         "HyperVault also hosts universal task boards — shared, versioned task "
-        "lists the user watches and steers live from a board page while you "
+        "lists the person watches and steers live from a board page while you "
         "work: read the list at session start (tasklist_get), claim a task "
         "before starting it (task_claim), push every meaningful change "
         "immediately (task_update / task_complete), and re-read periodically "
-        "with since_version so the user's steering is respected."
+        "with since_version so the person's steering is respected. "
+        "Only if they ask for an address of their own, claim_vanity_subdomain "
+        "gives them one like name.vault.cool."
     ),
 )
 
@@ -210,11 +248,14 @@ def build_http_app(path: str = "/mcp") -> Any:
     )
 
 
+def _api_base_url() -> str:
+    return os.environ.get("HYPERVAULT_API_URL", DEFAULT_API_URL).rstrip("/")
+
+
 def _client() -> httpx.Client:
     api_key = _resolve_api_key()
-    base_url = os.environ.get("HYPERVAULT_API_URL", DEFAULT_API_URL).rstrip("/")
     return httpx.Client(
-        base_url=base_url,
+        base_url=_api_base_url(),
         headers={API_KEY_HEADER: api_key},
         timeout=30.0,
     )
@@ -1046,6 +1087,39 @@ def list_memories(branch: str | None = None) -> dict[str, Any]:
         created_at}, newest first.
     """
     return _request("GET", "/api/memories", params={"branch": branch} if branch else None)
+
+
+@mcp.tool
+def read_memory(memory_id: str, branch: str | None = None) -> dict[str, Any]:
+    """Read one memory in full: its whole text, the memories and files it is
+    linked to, and where it came from.
+
+    Use it when recall or yours has pointed you at a memory and you need all
+    of it, not a summary — recall returns the exact text only for its top
+    matches, and yours returns names and one-line summaries.
+
+    Args:
+        memory_id: The memory's id, as returned by yours, recall, memorize or
+            list_memories.
+        branch: Optional mind branch to read it on (default "main").
+
+    Returns:
+        dict with `branch`, `memory` ({id, title, content, summary, tags,
+        source, created_at}), `related` (linked memories: {id, title,
+        summary, tags}), `artifacts` (files and pages it is linked to: {id,
+        slug, title, type}), `revision_count`, and `provenance` (who wrote it
+        last and when — left out when nothing is recorded). A memory that
+        isn't the person's, or doesn't exist, is "No such memory".
+    """
+    memory_id = memory_id.strip()
+    if not memory_id:
+        raise HyperVaultError("Pass the memory id to read (see yours, recall or list_memories).")
+    memory_id = _validate_ref_segment(memory_id, "memory id")
+    return _request(
+        "GET",
+        f"/api/memories/{memory_id}",
+        params={"branch": branch.strip()} if branch and branch.strip() else None,
+    )
 
 
 @mcp.tool
@@ -1968,12 +2042,205 @@ def delete_webhook(webhook_id: str) -> dict[str, Any]:
     return _request("DELETE", f"/api/webhooks/{_validate_ref_segment(webhook_id, 'webhook id')}")
 
 
+# ── Yours, keys and docs — /api/yours, /api/keys/granted-secrets, /start.md ──
+
+
+@mcp.tool
+def yours(query: str | None = None, kind: str = "all", limit: int = 25) -> dict[str, Any]:
+    """Look through everything the person has kept, by name: their memories,
+    files and groups, the ones they opened most recently first.
+
+    Use it to find something the person means by name ("the co-parenting
+    notes") before you read it, or to see what they have kept. It lists names
+    and one-line summaries only, never a page's contents or a group's files.
+    It does not list keys: ask my_keys for the keys you were allowed to use.
+
+    Args:
+        query: A name, or part of one, to look for (ignoring case). Leave it
+            out to list.
+        kind: "all" (default), "memory" or "file". Files are every stored
+            file — pages and groups included.
+        limit: How many to return (default 25, at most 50).
+
+    Returns:
+        dict with `results` — a list of {id, kind, name, summary, updated_at,
+        last_opened_at, href}, most recently opened first — and `recent`, the
+        first eight of them. `kind` is "memory", "file", "group" or "page".
+        Pass a memory's `id` to read_memory. Pass a page's `href` (a path like
+        /a/my-notes-x7k2p9) to read_artifact, or a group's (/g/...) to
+        read_artifact_group. Put an `href` after the HyperVault address to
+        get a link the person can open.
+    """
+    cleaned_kind = (kind or "all").strip().lower() or "all"
+    if cleaned_kind == "key":
+        raise HyperVaultError(
+            "yours doesn't list keys. Use my_keys to see the keys you were allowed to use."
+        )
+    if cleaned_kind not in YOURS_KINDS:
+        raise HyperVaultError(f"kind must be one of {', '.join(YOURS_KINDS)}, not {kind!r}.")
+    params: dict[str, Any] = {"kind": cleaned_kind, "limit": limit}
+    if query and query.strip():
+        params["q"] = query.strip()
+    return _request("GET", "/api/yours", params=params)
+
+
+@mcp.tool
+def my_keys() -> dict[str, Any]:
+    """List, by name, the keys the person let this agent use.
+
+    A key is a named credential the person keeps in HyperVault (an API token,
+    a header for a service) and chose to let your own key use. Call this to
+    learn what you were given before you reach for one; a key you were not
+    given is simply not listed. It is names only: this never returns a key's
+    value, and no tool here does. If you can send HTTP requests yourself, the
+    value of a key you were given is at GET /api/secrets/<name> on the
+    HyperVault address, with the same key header.
+
+    Returns:
+        dict with `secrets`, by name: [{name, kind, last_accessed_at}]. `kind`
+        is "opaque", "header" or "oauth_grant". `last_accessed_at` is when
+        any agent allowed that key last read it (null if none has), not only
+        you. An empty list means the person hasn't let this agent use a key
+        yet; they can from the key's card in HyperVault.
+    """
+    return _request("GET", "/api/keys/granted-secrets")
+
+
+def _doc_name(path: str) -> str:
+    """The short name (a key of DOC_PATHS) a caller's `path` stands for, or an
+    error naming the ones that exist. Matched whole against a fixed set of
+    spellings, so nothing that is not one of them reaches a request."""
+    name = _DOC_SPELLINGS.get((path or "").strip().lower())
+    if name is None:
+        raise HyperVaultError(
+            f"{path!r} is not a doc this tool reads. Pass one of: {', '.join(DOC_PATHS)}."
+        )
+    return name
+
+
+def _fetch_doc(url: str) -> str:
+    """Fetch one doc page. The request carries no API key and no other
+    credential: the docs are public, and an agent that has no key yet is
+    exactly who needs them. Redirects are not followed, so the text can only
+    come from the configured HyperVault address."""
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            response = client.get(url)
+    except httpx.HTTPError as exc:
+        raise HyperVaultError(f"Could not reach HyperVault ({exc.__class__.__name__}): {exc}") from exc
+    if response.status_code != 200:
+        raise HyperVaultError(f"HyperVault returned HTTP {response.status_code} for {url}.")
+    return response.text
+
+
+@mcp.tool
+def read_docs(path: str = "start", offset: int = 0) -> dict[str, Any]:
+    """Read one of HyperVault's own docs, a page at a time — for an agent that
+    has these tools but can't open web pages.
+
+    These are the pages an assistant would otherwise fetch from the HyperVault
+    site. They are public and the same for everyone, so no key is needed and
+    none is sent:
+
+    - start (/start.md): what to do when a person asks you to keep something,
+      how to get a key, and what to do when a request is refused.
+    - explain (/explain.md): how to explain HyperVault to a person in under a
+      minute, with one example from your conversation.
+    - connect (/connect.md): how each app, editor and API is given HyperVault,
+      and how to handle the key.
+    - llms (/llms.txt): an index of those pages.
+
+    Only those four can be read. A long doc comes back in pages: while
+    `next_offset` is not null, call again with offset=next_offset.
+
+    Args:
+        path: "start" (default), "explain", "connect" or "llms". The
+            "/start.md" spelling works too.
+        offset: Where to start, in characters: 0 for the first page, then the
+            `next_offset` of the page before.
+
+    Returns:
+        dict with `path`, `url` (where it was read from), `offset`, `total`
+        (characters in the whole doc), `next_offset` (null on the last page)
+        and `content`.
+    """
+    name = _doc_name(path)
+    if offset < 0:
+        raise HyperVaultError(
+            "offset can't be negative. Start at 0, then pass the next_offset of the page before."
+        )
+    url = f"{_api_base_url()}{DOC_PATHS[name]}"
+    text = _fetch_doc(url)
+    total = len(text)
+    if offset > total:
+        raise HyperVaultError(
+            f"offset {offset} is past the end of the doc, which is {total} characters long."
+        )
+    end = min(offset + DOCS_PAGE_CHARS, total)
+    if end < total:
+        # End a page on a line break when it has one, so a line isn't cut in two.
+        line_end = text.rfind("\n", offset, end)
+        if line_end > offset:
+            end = line_end + 1
+    return {
+        "path": name,
+        "url": url,
+        "offset": offset,
+        "total": total,
+        "next_offset": end if end < total else None,
+        "content": text[offset:end],
+    }
+
+
 @mcp.resource("hypervault://help")
 def get_vault_help() -> str:
     """How to use HyperVault from an agent."""
+    api = _api_base_url()
     return (
         "# HyperVault — agent quickstart\n\n"
-        "HyperVault is the user's permanent home for AI-created artifacts.\n\n"
+        "HyperVault keeps what the person's AI makes, as private links and\n"
+        "memory that only they can open. When they ask you to keep something,\n"
+        "save it with save_to_hypervault (private unless they say otherwise),\n"
+        "say \"Kept. Here's the link.\" and give the url exactly as the answer\n"
+        "has it.\n\n"
+        "## Read these first\n"
+        f"- {api}/start.md — what to do when a person asks you to keep\n"
+        "  something: the steps, how to get a key, and what to say when a\n"
+        "  request works or is refused.\n"
+        f"- {api}/explain.md — how to explain HyperVault to a person in\n"
+        "  under a minute, with one example from this conversation.\n"
+        "- If you can't open web pages, read_docs(path, offset) returns the\n"
+        "  same pages: path is 'start', 'explain', 'connect' (how each app\n"
+        "  and editor is given HyperVault) or 'llms' (an index). A long doc\n"
+        "  comes back in pages; while next_offset is not null, call again\n"
+        "  with offset=next_offset. No key is needed or sent.\n\n"
+        "## Talk in plain words\n"
+        "With the person, say keep, memory, file, group, key and page. Their\n"
+        "list of all of them is called Yours. Never say \"MCP\", \"grant\",\n"
+        "\"wiki\", \"subdomain\" or \"vault item\" to them. Some tool names and\n"
+        "descriptions below still use those older words (list_my_vault_items,\n"
+        "claim_vanity_subdomain, the memory 'wiki'); they are names for you,\n"
+        "not for the person.\n\n"
+        "## Find what's kept\n"
+        "- yours(query, kind, limit)\n"
+        "  Look through the person's memories, files and groups by name, the\n"
+        "  ones they opened last first. kind is 'all', 'memory' or 'file'\n"
+        "  (files include pages and groups); limit is at most 50. It returns\n"
+        "  {recent, results} of {id, kind, name, summary, updated_at,\n"
+        "  last_opened_at, href}: names and one-line summaries, never a\n"
+        "  page's contents. Pass a memory's id to read_memory, a page's href\n"
+        "  to read_artifact, a group's href to read_artifact_group. It never\n"
+        "  lists keys.\n"
+        "- read_memory(memory_id, branch=None)\n"
+        "  One memory in full: its text, linked memories and files, where it\n"
+        "  came from, and how many revisions it has. Use it after yours or\n"
+        "  recall points at one.\n"
+        "- my_keys()\n"
+        "  The keys the person let this agent use, by name, with the kind and\n"
+        "  when any allowed agent last read each: {secrets: [{name, kind,\n"
+        "  last_accessed_at}]}. Names only. No tool returns a key's value; a\n"
+        "  key you were not given is not listed, and an empty list means\n"
+        "  the person hasn't let you use one yet.\n\n"
         "## Tools\n"
         "1. save_to_hypervault(content, title, type, tags, connect_to,\n"
         "   make_pwa, source_prompt, visibility)\n"

@@ -538,6 +538,42 @@ class TestListMemories:
         )
 
 
+class TestReadMemory:
+    def test_default_branch(self, fake_request):
+        result = server.read_memory("mem-1")
+        assert result == {"ok": True}
+        fake_request.assert_called_once_with("GET", "/api/memories/mem-1", params=None)
+
+    def test_with_branch(self, fake_request):
+        server.read_memory("mem-1", branch="ideas")
+        fake_request.assert_called_once_with(
+            "GET", "/api/memories/mem-1", params={"branch": "ideas"}
+        )
+
+    def test_id_and_branch_are_trimmed(self, fake_request):
+        server.read_memory("  mem-1  ", branch=" ideas ")
+        fake_request.assert_called_once_with(
+            "GET", "/api/memories/mem-1", params={"branch": "ideas"}
+        )
+
+    def test_blank_branch_means_the_default(self, fake_request):
+        server.read_memory("mem-1", branch="   ")
+        fake_request.assert_called_once_with("GET", "/api/memories/mem-1", params=None)
+
+    def test_blank_id_raises_before_any_request(self, fake_request):
+        with pytest.raises(HyperVaultError, match="Pass the memory id to read"):
+            server.read_memory("   ")
+        fake_request.assert_not_called()
+
+    @pytest.mark.parametrize("bad_id", ["../yours", "..", ".", "a/b", "a\\b", "/api/secrets"])
+    def test_a_bad_id_is_rejected_before_any_request(self, fake_request, bad_id):
+        # The id goes straight into the request path. Without this guard an id
+        # like "../yours" would send the caller's key to a different endpoint.
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            server.read_memory(bad_id)
+        fake_request.assert_not_called()
+
+
 class TestForgetMemory:
     def test_default_branch(self, fake_request):
         server.forget_memory("mem-1")
@@ -1046,3 +1082,92 @@ class TestTruthEventsAndWebhooks:
             server.delete_webhook("../secrets")
         fake_request.assert_not_called()
 
+
+class TestYours:
+    def test_defaults_list_everything(self, fake_request):
+        result = server.yours()
+        assert result == {"ok": True}
+        fake_request.assert_called_once_with(
+            "GET", "/api/yours", params={"kind": "all", "limit": 25}
+        )
+
+    def test_query_kind_and_limit_ride_along(self, fake_request):
+        server.yours(query="co-parenting", kind="memory", limit=5)
+        fake_request.assert_called_once_with(
+            "GET", "/api/yours", params={"q": "co-parenting", "kind": "memory", "limit": 5}
+        )
+
+    def test_query_is_trimmed_and_a_blank_one_is_left_out(self, fake_request):
+        server.yours(query="  notes  ")
+        assert fake_request.call_args.kwargs["params"]["q"] == "notes"
+
+        fake_request.reset_mock()
+        server.yours(query="   ")
+        assert "q" not in fake_request.call_args.kwargs["params"]
+
+    def test_kind_is_trimmed_and_case_insensitive(self, fake_request):
+        server.yours(kind=" File ")
+        assert fake_request.call_args.kwargs["params"]["kind"] == "file"
+
+    def test_blank_kind_means_all(self, fake_request):
+        server.yours(kind="  ")
+        assert fake_request.call_args.kwargs["params"]["kind"] == "all"
+
+    def test_every_offered_kind_is_sent_as_is(self, fake_request):
+        for kind in server.YOURS_KINDS:
+            fake_request.reset_mock()
+            server.yours(kind=kind)
+            assert fake_request.call_args.kwargs["params"]["kind"] == kind
+
+    @pytest.mark.parametrize("kind", ["key", " Key ", "KEY"])
+    def test_keys_are_not_listed_here_and_the_error_points_at_my_keys(self, fake_request, kind):
+        # The backend answers an agent's kind=key with a 403. Offering it would
+        # only send a request that is certain to fail.
+        with pytest.raises(HyperVaultError, match="my_keys"):
+            server.yours(kind=kind)
+        fake_request.assert_not_called()
+
+    @pytest.mark.parametrize("kind", ["keys", "group", "page", "everything", "memory,file"])
+    def test_an_unknown_kind_is_rejected_before_any_request(self, fake_request, kind):
+        with pytest.raises(HyperVaultError, match="kind must be one of all, memory, file"):
+            server.yours(kind=kind)
+        fake_request.assert_not_called()
+
+    def test_the_offered_kinds_never_include_key(self):
+        assert "key" not in server.YOURS_KINDS
+
+
+class TestMyKeys:
+    def test_calls_the_granted_secrets_endpoint_with_no_arguments(self, fake_request):
+        fake_request.return_value = {"secrets": [{"name": "github-token", "kind": "header", "last_accessed_at": None}]}
+        result = server.my_keys()
+        fake_request.assert_called_once_with("GET", "/api/keys/granted-secrets")
+        assert result == {"secrets": [{"name": "github-token", "kind": "header", "last_accessed_at": None}]}
+
+    def test_an_empty_list_comes_back_as_is(self, fake_request):
+        fake_request.return_value = {"secrets": []}
+        assert server.my_keys() == {"secrets": []}
+
+    def test_it_takes_no_argument_that_could_name_a_key_or_an_agent(self):
+        import inspect
+
+        assert list(inspect.signature(server.my_keys).parameters) == []
+
+
+class TestNoToolReadsAKeysValue:
+    """The value of a key is read by an agent that can send HTTP requests,
+    at GET /api/secrets/<name>. No tool of this server wraps that route, so no
+    MCP result can ever hold a key's value."""
+
+    def test_no_tool_requests_the_secrets_routes(self):
+        import inspect
+        import re
+
+        source = inspect.getsource(server)
+        # A request path is always a string literal starting with the slash (the
+        # docstrings that mention the route have a space or a backtick first).
+        assert re.findall(r"""["']/api/secrets""", source) == []
+        assert re.findall(r"""["']/api/keys/(?!granted-secrets["'])""", source) == []
+
+    def test_no_tool_is_named_for_a_secret(self, tool_names):
+        assert not [name for name in tool_names if "secret" in name]
