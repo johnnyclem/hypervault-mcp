@@ -78,7 +78,11 @@ Authentication differs by transport — see [Auth & rate limits](#auth--rate-lim
 | `memorize(content, title, tags, source)` | Stores a chunk in the user's **private memory wiki** (Imaging V2). Auto-titled, auto-tagged, summarized, and linked to related memories in their knowledge graph. |
 | `recall(query)` | Natural-language search over the wiki ("what did I say about the Rust borrow checker?"). Top matches return the exact stored content; every match lists its linked memories. |
 | `list_memories()` | Browses everything memorized, newest first (summaries + tags). |
+| `read_memory(memory_id, branch=None)` | Reads one memory in full: its whole text, the memories and files it is linked to, where it came from (`provenance`, left out when nothing is recorded) and its `revision_count`. Use it after `yours` or `recall` points at one. The id is checked locally before any request. |
 | `forget_memory(memory_id)` | Permanently deletes one memory — only on the user's explicit request. |
+| `yours(query, kind, limit)` | Looks through everything the person has kept, by name — memories, files and groups, the ones they opened most recently first. `kind` is `all`, `memory` or `file` (files include pages and groups); `limit` is at most 50. Answers `{recent, results}` of `{id, kind, name, summary, updated_at, last_opened_at, href}`: names and one-line summaries, never a page's contents. It does not list keys (`kind="key"` is refused with a pointer to `my_keys`). See [Finding what's kept](#finding-whats-kept) below. |
+| `my_keys()` | Lists, by name, the keys the person let this agent use: `{secrets: [{name, kind, last_accessed_at}]}`. Names only — no tool of this server returns a key's value. |
+| `read_docs(path, offset)` | Reads one of HyperVault's own docs for an agent that has these tools but no web access: `path` is `start` (`/start.md`), `explain`, `connect` or `llms`; nothing else can be requested. Long docs come back in pages: while `next_offset` is not null, call again with `offset=next_offset`. Needs no key and sends none. |
 | `create_task_board(title, project, tasks, stages, visibility)` | Creates a **universal task board** — a shared, versioned task list — plus the interactive board page the user watches it on. Returns `project` (what every other task tool takes) and `board.url` (the human deliverable). See [Universal task boards](#universal-task-boards-shared-work-lists) below. |
 | `list_task_boards()` | Lists the user's existing boards, so you can join one instead of creating a duplicate. |
 | `tasklist_get(project, since_version=None)` | Reads the full list. With `since_version` you get `{unchanged: true, version}` when nothing moved — the cheap poll. |
@@ -92,6 +96,45 @@ Plus the `hypervault://help` resource with agent-facing usage notes.
 
 Memories are owner-only: they power the Memory Control Panel at
 `/vault/memory` and are never rendered on public pages.
+
+### Finding what's kept
+
+Three tools let an agent look before it acts, and one lets it read the setup
+docs:
+
+```python
+yours(query="co-parenting")                 # -> {recent, results}: names, kinds, one-line summaries, hrefs
+read_memory(results[0]["id"])               # -> that memory in full, with its links and provenance
+my_keys()                                   # -> {secrets: [{name, kind, last_accessed_at}]}
+read_docs("start")                          # -> {path, url, offset, total, next_offset, content}
+```
+
+- **`yours`** wraps `GET /api/yours`. A memory's `id` goes to `read_memory`; a
+  page's `href` (`/a/<slug>`) goes to `read_artifact`, a group's (`/g/<slug>`)
+  to `read_artifact_group`. Keys are not in it: the backend refuses an agent
+  that asks for them, so the tool never offers `kind="key"`.
+- **`read_memory`** wraps `GET /api/memories/<id>?branch=`. The id is checked
+  with the same path-segment guard as `forget_memory`.
+- **`my_keys`** wraps `GET /api/keys/granted-secrets`: the keys the person let
+  *this* key use, never another agent's, and never a value, id or description.
+  `last_accessed_at` is when any agent allowed that key last read it. No tool in
+  this server returns a key's value (a test pins that none requests
+  `/api/secrets/...`); an agent that can send HTTP requests reads one itself
+  with `GET /api/secrets/<name>` and its own key header.
+- **`read_docs`** fetches `/start.md`, `/explain.md`, `/connect.md` or
+  `/llms.txt` from `HYPERVAULT_API_URL` and nothing else: the four names are
+  matched whole (no query string, no `..`, no URL, no redirect followed). The
+  docs are public, so the call carries no API key and works before an agent
+  has one (an agent with no key is who needs the setup docs most). A page is
+  up to 20,000 characters; `offset` and `next_offset` count characters.
+
+These need a HyperVault deployment that has `GET /api/yours` and
+`GET /api/keys/granted-secrets`; against an older one the tool reports
+`HyperVault returned HTTP 404.` The server's instructions and the
+`hypervault://help` resource speak the same plain words the product does
+(keep, memory, file, group, key, page) and point at `/start.md` and
+`/explain.md`; the older tool names (`list_my_vault_items`,
+`claim_vanity_subdomain`, ...) are unchanged so connected agents keep working.
 
 ### Mutable artifacts (a living document)
 
@@ -227,9 +270,10 @@ reach for `tasklist_summary` and `since_version` polling instead.
 
 The server is single-host on purpose: every tool call — including
 `extract_source_prompt`, which resolves artifact URLs through the backend's
-`/api/extract` — goes to the API origin only. That means it works inside
-deny-by-default sandboxes like [greywall](https://github.com/johnnyclem/greywall)
-with exactly one domain allowed:
+`/api/extract`, and `read_docs` — goes to the API origin only. That means it
+works inside deny-by-default sandboxes like
+[greywall](https://github.com/johnnyclem/greywall) with exactly one domain
+allowed:
 
 ```bash
 export HYPERVAULT_API_KEY=hv_...
@@ -306,7 +350,9 @@ tools (body shaping, the empty-patch and blank-`agent_name` guards, and the
 most importantly — the per-request auth model: header parsing, the
 STDIO-vs-HTTP key resolution split, and full end-to-end requests against the
 real ASGI app proving an unauthenticated `tools/call` is rejected even when
-an operator `HYPERVAULT_API_KEY` is set in the environment.
+an operator `HYPERVAULT_API_KEY` is set in the environment. The `read_docs`
+tests pin what can reach the network (the four docs, on the configured origin,
+with no credential and no redirect) and how long docs are paged.
 
 ## Smoke test
 
