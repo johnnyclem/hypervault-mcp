@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import MagicMock
 
 import pytest
 from fastmcp import Client
 
 from hypervault_mcp import server
+
+
+@pytest.fixture
+def fake_request(monkeypatch):
+    """Replaces server._request with a mock that answers {"ok": True}, so a
+    tool test can assert on the method, path and payload a tool builds without
+    any network. Shared by test_tools.py and test_mail_tools.py."""
+    mock = MagicMock(return_value={"ok": True})
+    monkeypatch.setattr(server, "_request", mock)
+    return mock
 
 
 @pytest.fixture(autouse=True)

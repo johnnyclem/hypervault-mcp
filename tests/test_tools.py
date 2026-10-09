@@ -16,13 +16,6 @@ from hypervault_mcp import server
 from hypervault_mcp.server import HyperVaultError
 
 
-@pytest.fixture
-def fake_request(monkeypatch):
-    mock = MagicMock(return_value={"ok": True})
-    monkeypatch.setattr(server, "_request", mock)
-    return mock
-
-
 class TestSaveToHypervault:
     def test_minimal_call_defaults(self, fake_request):
         result = server.save_to_hypervault(content="<h1>hi</h1>")
