@@ -1164,3 +1164,246 @@ class TestNoToolReadsAKeysValue:
 
     def test_no_tool_is_named_for_a_secret(self, tool_names):
         assert not [name for name in tool_names if "secret" in name]
+
+
+# ── Truth ledger & graph ──────────────────────────────────────────────────────
+
+
+class TestTruthLedgerTools:
+    def test_list_truth_ledgers_renders_one_line_per_ledger(self, fake_request):
+        fake_request.return_value = {"default": "default", "ledgers": [{"slug": "default", "kind": "mirror", "name": "Default"}, {"slug": "case", "kind": "hosted", "name": "Smith v. Jones"}]}
+        text = server.list_truth_ledgers()
+        fake_request.assert_called_once_with("GET", "/api/truth/ledgers")
+        assert "2 truth ledger(s); default: default." in text
+        assert "case [hosted] Smith v. Jones" in text
+
+    def test_truth_current_renders_citable_contested_clouded_and_flags_with_ids(self, fake_request):
+        fake_request.return_value = {
+            "ledger": {"slug": "case", "kind": "hosted"},
+            "summary": {"cited": 2, "contested": 1, "clouded": 1, "flags": 1, "stale": 1, "displaced": 3, "total": 7, "open_proposals": 0},
+            "chat_truth": True,
+            "citable": [
+                {"entry": {"id": "01A", "type": "TB", "claim": "Smith was in Denver.", "signedBy": "johnny"}, "standing": "sound", "contested_by": []},
+                {
+                    "entry": {"id": "01B", "type": "TB", "claim": "The signature is forged.", "signedBy": "johnny", "answerableBy": "sam", "status": "contested"},
+                    "standing": "clouded",
+                    "reasons": [{"premise": "01U", "reason": "premise-open"}],
+                    "contested_by": [{"id": "01C", "type": "UV", "assertion": "It is genuine."}],
+                },
+            ],
+            "flags": [{"id": "01U", "type": "UV", "assertion": "The pen was blue.", "basis": "a photo", "freshness": {"state": "stale"}}],
+        }
+        text = server.truth_current("case")
+        fake_request.assert_called_once_with("GET", "/api/truth", params={"ledger": "case"})
+        lines = text.split("\n")
+        assert lines[0].startswith("Truth ledger case (hosted): 2 citable (1 contested, 1 clouded), 1 open flags (1 stale), 3 displaced, 7 entries total")
+        assert "[TB active] Smith was in Denver. (signed: johnny, id 01A)" in lines
+        assert "[TB under appeal, clouded by 01U open] The signature is forged. (signed: johnny, answerable: sam, id 01B)" in lines
+        assert "  disputed by [UV] It is genuine. (01C)" in lines
+        assert "[UV open] [stale] The pen was blue. — basis: a photo (01U)" in lines
+
+    def test_truth_current_says_what_to_do_when_empty(self, fake_request):
+        fake_request.return_value = {"ledger": {"slug": "case", "kind": "hosted"}, "summary": {}, "citable": [], "flags": []}
+        assert "assert a UV with assert_truth" in server.truth_current("case")
+
+    def test_truth_docket_renders_items_and_their_flags(self, fake_request):
+        fake_request.return_value = {
+            "size": 1,
+            "nominated": 0,
+            "stale": 1,
+            "oldest": {"ageMs": 7_200_000},
+            "review": {"cadence": "weekly", "due": True},
+            "items": [
+                {
+                    "kind": "uv",
+                    "id": "01U",
+                    "text": "The pen was blue.",
+                    "author": "agent:claude",
+                    "status": "open",
+                    "standing": "sound",
+                    "stale": True,
+                    "approvals": {"approvers": 1, "human": False, "agentSessions": 1, "missing": ["a human approval"]},
+                }
+            ],
+        }
+        text = server.truth_docket()
+        fake_request.assert_called_once_with("GET", "/api/truth/docket", params={})
+        assert "Docket: 1 item(s), 0 nominated, 1 stale; oldest waiting 2h." in text
+        assert "Review cadence: weekly; a session is due." in text
+        assert "[uv] 01U — The pen was blue.  (stale)" in text
+        assert "approvals: 1 (no person yet, 1 agent session(s)); missing: a human approval" in text
+
+    def test_bad_ledger_slug_is_refused_before_any_call(self, fake_request):
+        with pytest.raises(HyperVaultError, match="ledger must be a slug"):
+            server.truth_current("Smith v Jones")
+        fake_request.assert_not_called()
+
+
+class TestAssertTruth:
+    VERIFY = {"kind": "inspect", "value": "deposition.pdf"}
+
+    def test_root_uv_sends_the_minimal_body(self, fake_request):
+        server.assert_truth("Smith was in Denver.", "deposition p.12", self.VERIFY, ledger="case")
+        fake_request.assert_called_once_with(
+            "POST", "/api/truth/entries", json={"type": "UV", "assertion": "Smith was in Denver.", "basis": "deposition p.12", "verifyBy": self.VERIFY, "ledger": "case"}
+        )
+
+    def test_derived_uv_carries_premises_and_inference_and_the_rest(self, fake_request):
+        server.assert_truth(" x ", " y ", self.VERIFY, contests="01T", derives=["01A", "01A", "01B"], inference=" because ", horizon=3600, agent_session_id="s1")
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"] == {
+            "type": "UV",
+            "assertion": "x",
+            "basis": "y",
+            "verifyBy": self.VERIFY,
+            "contests": "01T",
+            "derives": ["01A", "01B"],
+            "inference": "because",
+            "horizon": 3600,
+            "agentSessionId": "s1",
+        }
+
+    def test_premises_and_inference_come_together(self, fake_request):
+        with pytest.raises(HyperVaultError, match="derives comes with inference"):
+            server.assert_truth("x", "y", self.VERIFY, derives=["01A"])
+        with pytest.raises(HyperVaultError, match="inference comes with derives"):
+            server.assert_truth("x", "y", self.VERIFY, inference="because")
+        with pytest.raises(HyperVaultError, match="derives must be a list"):
+            server.assert_truth("x", "y", self.VERIFY, derives="01A", inference="because")
+        fake_request.assert_not_called()
+
+    def test_refuses_blank_text_a_bad_verify_by_and_a_bad_horizon(self, fake_request):
+        with pytest.raises(HyperVaultError, match="assertion and basis are required"):
+            server.assert_truth(" ", "y", self.VERIFY)
+        with pytest.raises(HyperVaultError, match="verify_by must be an object"):
+            server.assert_truth("x", "y", "inspect")  # type: ignore[arg-type]
+        with pytest.raises(HyperVaultError, match="horizon must be"):
+            server.assert_truth("x", "y", self.VERIFY, horizon=0)
+        fake_request.assert_not_called()
+
+
+class TestApproveTruth:
+    def test_sends_evidence_session_note_and_ledger(self, fake_request):
+        server.approve_truth(" 01U ", [{"kind": "file", "ref": "a.ts:1"}], agent_session_id="s2", note=" checked ", ledger="case")
+        fake_request.assert_called_once_with(
+            "POST", "/api/truth/approvals", json={"id": "01U", "evidence": [{"kind": "file", "ref": "a.ts:1"}], "agentSessionId": "s2", "note": "checked", "ledger": "case"}
+        )
+
+    def test_needs_an_id_and_evidence(self, fake_request):
+        with pytest.raises(HyperVaultError, match="Pass the UV id"):
+            server.approve_truth(" ", [{"kind": "file", "ref": "a"}])
+        with pytest.raises(HyperVaultError, match="at least one evidence item"):
+            server.approve_truth("01U", [])
+        fake_request.assert_not_called()
+
+
+class TestTruthGraphReads:
+    def test_derivation_and_ripple_quote_the_id_into_the_path(self, fake_request):
+        server.truth_derivation(" 01A/x ", ledger="case")
+        server.truth_ripple("01A", ledger="case")
+        server.truth_ripple("01A")
+        assert fake_request.mock_calls[0].args == ("GET", "/api/truth/01A%2Fx/derivation")
+        assert fake_request.mock_calls[0].kwargs == {"params": {"ledger": "case"}}
+        assert fake_request.mock_calls[1].args == ("GET", "/api/truth/01A/ripple")
+        assert fake_request.mock_calls[2].kwargs == {"params": {}}
+        with pytest.raises(HyperVaultError, match="Pass the entry id"):
+            server.truth_ripple(" ")
+
+    def test_truth_context_reads_an_item_or_an_entry_never_both(self, fake_request):
+        server.truth_context("memory", "11111111-1111-4111-8111-111111111111")
+        fake_request.assert_called_with("GET", "/api/truth/context", params={"kind": "memory", "id": "11111111-1111-4111-8111-111111111111"})
+        server.truth_context("artifact", "deposition-smith", ledger="case")
+        fake_request.assert_called_with("GET", "/api/truth/context", params={"kind": "artifact", "id": "deposition-smith", "ledger": "case"})
+        server.truth_context(entry_id="01A", ledger="case")
+        fake_request.assert_called_with("GET", "/api/truth/context", params={"entry": "01A", "ledger": "case"})
+        with pytest.raises(HyperVaultError, match="not both"):
+            server.truth_context("memory", "x", entry_id="01A")
+        with pytest.raises(HyperVaultError, match="Pass an item"):
+            server.truth_context()
+        with pytest.raises(HyperVaultError, match="kind must be one of"):
+            server.truth_context("page", "x")
+
+    def test_truth_stale_takes_the_ledger_or_every_ledger(self, fake_request):
+        server.truth_stale()
+        fake_request.assert_called_with("GET", "/api/truth/stale", params={})
+        server.truth_stale("case")
+        fake_request.assert_called_with("GET", "/api/truth/stale", params={"ledger": "case"})
+
+
+class TestLinkTruthContext:
+    def test_links_a_memory_with_the_defaults(self, fake_request):
+        server.link_truth_context("memory", "11111111-1111-4111-8111-111111111111", ["01A", "01B", "01A"])
+        fake_request.assert_called_once_with(
+            "POST", "/api/truth/context", json={"kind": "memory", "id": "11111111-1111-4111-8111-111111111111", "rests_on": ["01A", "01B"], "relation": "rests_on"}
+        )
+
+    def test_links_a_page_as_a_source_with_a_note_in_a_ledger(self, fake_request):
+        server.link_truth_context("artifact", " deposition-smith ", ["01A"], relation="source", note=" where the claim was read ", ledger="case")
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"] == {"kind": "artifact", "id": "deposition-smith", "rests_on": ["01A"], "relation": "source", "note": "where the claim was read", "ledger": "case"}
+
+    def test_refuses_a_bad_kind_relation_or_list(self, fake_request):
+        with pytest.raises(HyperVaultError, match="kind must be one of"):
+            server.link_truth_context("page", "x", ["01A"])
+        with pytest.raises(HyperVaultError, match="relation must be one of"):
+            server.link_truth_context("memory", "x", ["01A"], relation="depends")
+        with pytest.raises(HyperVaultError, match="at least one entry id"):
+            server.link_truth_context("memory", "x", [])
+        with pytest.raises(HyperVaultError, match="at most 32"):
+            server.link_truth_context("memory", "x", [f"01{i:03d}" for i in range(33)])
+        with pytest.raises(HyperVaultError, match="not a valid reference"):
+            server.link_truth_context("memory", "../x", ["01A"])
+        fake_request.assert_not_called()
+
+    def test_unlink_sends_the_entries_only_when_given(self, fake_request):
+        server.unlink_truth_context("memory", "m1", ["01A"], ledger="case")
+        fake_request.assert_called_with("DELETE", "/api/truth/context", json={"kind": "memory", "id": "m1", "entries": ["01A"], "ledger": "case"})
+        server.unlink_truth_context("artifact", "deposition-smith")
+        fake_request.assert_called_with("DELETE", "/api/truth/context", json={"kind": "artifact", "id": "deposition-smith"})
+
+
+class TestResolveTruthStale:
+    def test_relink_needs_a_target_and_sends_it(self, fake_request):
+        server.resolve_truth_stale("memory", "m1", "relink", entries=["01U"], to=["01T"], relation="rests_on", note=" moved to the TB ", ledger="case")
+        fake_request.assert_called_once_with(
+            "POST",
+            "/api/truth/stale",
+            json={"kind": "memory", "id": "m1", "action": "relink", "entries": ["01U"], "to": ["01T"], "relation": "rests_on", "note": "moved to the TB", "ledger": "case"},
+        )
+        with pytest.raises(HyperVaultError, match="Pass to"):
+            server.resolve_truth_stale("memory", "m1", "relink")
+
+    def test_reaffirm_and_unlink_send_the_minimal_body_and_refuse_a_stray_target(self, fake_request):
+        server.resolve_truth_stale("memory", "m1", "Reaffirm")
+        fake_request.assert_called_with("POST", "/api/truth/stale", json={"kind": "memory", "id": "m1", "action": "reaffirm"})
+        server.resolve_truth_stale("artifact", "p1", "unlink", entries=["01A"])
+        fake_request.assert_called_with("POST", "/api/truth/stale", json={"kind": "artifact", "id": "p1", "action": "unlink", "entries": ["01A"]})
+        with pytest.raises(HyperVaultError, match="action must be one of"):
+            server.resolve_truth_stale("memory", "m1", "forget")
+        with pytest.raises(HyperVaultError, match="to goes with"):
+            server.resolve_truth_stale("memory", "m1", "reaffirm", to=["01T"])
+
+
+class TestMemoryRestsOn:
+    def test_memorize_carries_rests_on_and_the_ledger_only_when_given(self, fake_request):
+        server.memorize("Case theory.", rests_on=["01B", "01B"], truth_ledger="case")
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert kwargs["json"]["rests_on"] == ["01B"]
+        assert kwargs["json"]["truth_ledger"] == "case"
+        fake_request.reset_mock()
+        server.memorize("Plain.")
+        _, _, kwargs = fake_request.mock_calls[0]
+        assert "rests_on" not in kwargs["json"] and "truth_ledger" not in kwargs["json"]
+
+    def test_edit_memory_relinks_with_an_empty_list_too(self, fake_request):
+        server.edit_memory("mem-1", rests_on=[], truth_ledger="case")
+        fake_request.assert_called_once_with(
+            "PATCH", "/api/memories/mem-1", json={"content": None, "title": None, "tags": None, "message": None, "branch": None, "rests_on": [], "truth_ledger": "case"}
+        )
+
+    def test_a_ledger_without_entries_is_refused(self, fake_request):
+        with pytest.raises(HyperVaultError, match="truth_ledger goes with rests_on"):
+            server.memorize("x", truth_ledger="case")
+        with pytest.raises(HyperVaultError, match="rests_on must be a list"):
+            server.edit_memory("mem-1", rests_on="01A")  # type: ignore[arg-type]
+        fake_request.assert_not_called()
