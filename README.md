@@ -68,6 +68,12 @@ Authentication differs by transport — see [Auth & rate limits](#auth--rate-lim
 | `truth_events(since, author, kind, unseen, mark_seen, limit)` | What changed in the ledger that concerns you: your TBs/UVs **challenged, overturned, upheld or verified**, newest first. `unseen=True` (default) uses a per-key cursor so you only see news since you last looked; `author` narrows to entries you authored or signed. Chat and room turns get these as a system notice automatically; this is the explicit pull. |
 | `register_webhook(url, name, events, authors, secret)` | Register a webhook: HyperVault POSTs signed JSON (`X-HyperVault-Signature: t=…,v1=HMAC-SHA256("t.body")`) to your URL on every matching truth event. `authors=[your name]` limits it to your entries. The secret is returned once. Retries with backoff; `test_webhook` sends a signed ping. |
 | `list_webhooks()` / `webhook_status(webhook_id)` / `test_webhook(webhook_id)` / `delete_webhook(webhook_id)` | Manage webhooks: list them (never the secrets), see a hook's last 25 deliveries, send a `truth.test` ping, remove one. |
+| `list_truth_ledgers()` / `truth_current(ledger)` / `truth_docket(ledger)` | The person's truth ledgers (every truth tool takes an optional `ledger` slug; omitted means `default`); one ledger's current truth as readable text (`[TB active]` lines with ids, contested ones with their disputing UVs, `[UV open]` flags); what waits on the person in review. See [Truth: facts and the graph around them](#truth-facts-and-the-graph-around-them). |
+| `assert_truth(assertion, basis, verify_by, contests, derives, inference, horizon, agent_session_id, ledger)` | Assert a **UV** in a hosted ledger as `agent:<key name>` — believed, flagged, never proven. `derives` + `inference` make it a derived claim whose standing follows its premises; `contests` puts a TB under appeal. Nothing an agent writes is a TB. |
+| `approve_truth(uv_id, evidence, agent_session_id, note, ledger)` | Approve an open UV with settling evidence of your own; the person's approval plus yours promotes it to a TB (the UV's successor). |
+| `truth_derivation(entry_id, ledger)` / `truth_ripple(entry_id, ledger)` | The view down (the premises under an entry, the failing one marked) and the view up and out (every entry resting on it, transitively, and every memory or page resting on any of them — the recursive search a change needs). |
+| `link_truth_context(kind, item_id, rests_on, relation, note, ledger)` / `unlink_truth_context(...)` / `truth_context(kind, item_id \| entry_id, ledger)` | A memory or page rests on some TBs and UVs (`memorize` and `edit_memory` take `rests_on` directly). Relations: `rests_on`, `cites`, `source` (provenance, never stale). Read what an item rests on, or what rests on an entry. |
+| `truth_stale(ledger)` / `resolve_truth_stale(kind, item_id, action, entries, to, relation, note, ledger)` | The worklist: every memory or page whose facts moved since it last saw them, with the entry as it is now and its successor when a UV became a TB or a TB was restated; and the way off it (reaffirm, relink, unlink) for an item not rewritten with `edit_memory(rests_on=...)`. |
 | `create_artifact_group(files, title, tags, connect_to, visibility, source_prompt)` | Saves a multi-file **artifact group** — several `.html`/`.css`/`.js`/`.jsx` files that run together — behind a required root `index.html`. Returns a JSFiddle-style run/preview URL (see [Artifact groups](#artifact-groups-multi-file-projects) below). |
 | `read_artifact_group(ref)` | Reads a group's full file set and metadata by slug or URL. |
 | `list_artifact_groups()` | Lists everything already saved as a group. |
@@ -103,6 +109,52 @@ Plus the `hypervault://help` resource with agent-facing usage notes.
 
 Memories are owner-only: they power the Memory Control Panel at
 `/vault/memory` and are never rendered on public pages.
+
+### Truth: facts and the graph around them
+
+A person's truth ledger (HyperVault's `docs/truth-ledger.md`) holds two kinds
+of line. A **TB** is a settled claim a named person signed, with evidence —
+ground truth, cited over anything a conversation or a recalled memory says.
+A **UV** is believed and unverified — a flag, never a fact. An agent asserts
+UVs; a UV becomes a TB only when the person approves it in review and one
+more approver agrees. The record is append-only: nothing is edited, a change
+is a new line.
+
+The graph around it (`docs/truth-graph.md`) is what makes a case file work:
+
+```python
+# A hosted ledger per case (the person creates it on /vault/truth).
+truth_current(ledger="smith-v-jones")
+
+# Claims read from a document are roots; conclusions derive from them.
+a = assert_truth("Smith was in Denver on March 3.", basis="deposition p.12",
+                 verify_by={"kind": "inspect", "value": "deposition-smith.pdf"}, ledger="smith-v-jones")
+b = assert_truth("Smith could not have signed in Boston that day.", basis="flight records",
+                 verify_by={"kind": "inspect", "value": "flights.csv"},
+                 derives=[a["line"]["id"]], inference="Denver and Boston are a day apart.", ledger="smith-v-jones")
+
+# The document the claim came from, as provenance; a memory built on the conclusion.
+link_truth_context("artifact", "deposition-smith", [a["line"]["id"]], relation="source", ledger="smith-v-jones")
+memorize("Case theory: the Boston signature is a forgery, since Smith was in Denver.",
+         rests_on=[b["line"]["id"]], truth_ledger="smith-v-jones")
+
+# Later: the deposition is recanted and the person strikes claim a. Everything built on it is found:
+truth_ripple(a["line"]["id"], ledger="smith-v-jones")   # b is unsupported; the memory rests on b
+truth_stale()                                           # the memory, with b as it is now
+# ...read it, re-derive it, write it back naming what it rests on now:
+edit_memory(memory_id, content="Case theory: ...", rests_on=[...], truth_ledger="smith-v-jones")
+```
+
+Every write to the ledger compares the fold with what each edge last saw, so
+a fact overturned, verified, undermined or restored reaches the memories and
+pages built on it; `truth_stale` is the worklist, oldest first, each entry
+with its **successor** when one superseded it (the TB a promoted UV became,
+the restatement of an overturned TB). Nothing rewrites a memory: the agent
+re-derives, and `edit_memory(rests_on=...)` takes it off the list. A `source`
+edge (the document a claim was read from) is provenance and never goes stale.
+
+Creating a ledger, asserting a TB and restating one (`supersedes`) stay the
+person's acts, signed in.
 
 ### Finding what's kept
 

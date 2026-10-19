@@ -64,6 +64,19 @@ class TestVaultHelpResource:
             "my_keys",
             "read_memory",
             "read_docs",
+            "list_truth_ledgers",
+            "truth_current",
+            "truth_docket",
+            "assert_truth",
+            "approve_truth",
+            "truth_derivation",
+            "truth_ripple",
+            "link_truth_context",
+            "unlink_truth_context",
+            "truth_context",
+            "truth_stale",
+            "resolve_truth_stale",
+            "truth_events",
         ]:
             assert tool_name in text, f"{tool_name} missing from help text"
 

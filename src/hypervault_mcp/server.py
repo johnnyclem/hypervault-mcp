@@ -41,6 +41,7 @@ import os
 import re
 import socket
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from fastmcp import FastMCP
@@ -1013,6 +1014,8 @@ def memorize(
     source: str = "agent",
     branch: str | None = None,
     message: str | None = None,
+    rests_on: list[str] | None = None,
+    truth_ledger: str | None = None,
 ) -> dict[str, Any]:
     """Store a chunk of context in the user's private memory wiki (Imaging V2).
 
@@ -1021,6 +1024,12 @@ def memorize(
     session. The backend auto-titles, auto-tags, and summarizes the chunk,
     then links it to related memories in the user's knowledge graph.
     Memories are private to the user — they never appear on public pages.
+
+    When the memory is built on facts in a truth ledger (a conclusion drawn
+    from settled claims, a summary of where a case stands), name them in
+    `rests_on`: the memory then rests on those TBs and UVs, and when one of
+    them is overturned, verified or undermined the memory shows up on
+    truth_stale as something to re-derive. See truth_ripple and truth_stale.
 
     Args:
         content: The text to memorize — a conclusion, a code insight, a
@@ -1032,24 +1041,30 @@ def memorize(
         branch: Optional mind branch to write on (default "main"). Create
             branches with mind_branch to explore ideas without touching main.
         message: Optional commit message (default "memorize: <title>").
+        rests_on: Optional ids of the TBs and UVs this memory rests on (at
+            most 32), in `truth_ledger`. The memory is kept even when a link
+            is refused; `truth_rests_on` in the answer says what was linked.
+        truth_ledger: The ledger slug the entries are in (default "default";
+            see list_truth_ledgers).
 
     Returns:
         dict with `id`, the derived `title`, `summary`, `tags`, `links`
         (how many related memories it was connected to), the `branch` and
-        `commit_id` the write landed as, and a `message`.
+        `commit_id` the write landed as, a `message`, and — when rests_on was
+        given — `truth_rests_on` ({ledger, linked, entries} or {error}).
+        Also `truth_warnings` (values the memory asserts that the truth
+        ledger retired) and `truth_check`; the memory is kept either way.
     """
-    return _request(
-        "POST",
-        "/api/memories",
-        json={
-            "content": content,
-            "title": title,
-            "tags": tags or [],
-            "source": source,
-            "branch": branch,
-            "message": message,
-        },
-    )
+    body: dict[str, Any] = {
+        "content": content,
+        "title": title,
+        "tags": tags or [],
+        "source": source,
+        "branch": branch,
+        "message": message,
+    }
+    body.update(_rests_on_fields(rests_on, truth_ledger))
+    return _request("POST", "/api/memories", json=body)
 
 
 @mcp.tool
@@ -1104,7 +1119,7 @@ def list_memories(branch: str | None = None) -> dict[str, Any]:
 @mcp.tool
 def read_memory(memory_id: str, branch: str | None = None) -> dict[str, Any]:
     """Read one memory in full: its whole text, the memories and files it is
-    linked to, and where it came from.
+    linked to, where it came from, and the truth entries it rests on.
 
     Use it when recall or yours has pointed you at a memory and you need all
     of it, not a summary — recall returns the exact text only for its top
@@ -1119,9 +1134,13 @@ def read_memory(memory_id: str, branch: str | None = None) -> dict[str, Any]:
         dict with `branch`, `memory` ({id, title, content, summary, tags,
         source, created_at}), `related` (linked memories: {id, title,
         summary, tags}), `artifacts` (files and pages it is linked to: {id,
-        slug, title, type}), `revision_count`, and `provenance` (who wrote it
-        last and when — left out when nothing is recorded). A memory that
-        isn't the person's, or doesn't exist, is "No such memory".
+        slug, title, type}), `revision_count`, `provenance` (who wrote it
+        last and when — left out when nothing is recorded), and `truth`
+        ({rests_on: [{ledger, entry, relation, stale_since, stale_kind,
+        stale_summary, successor, ...}], stale}): the TBs and UVs it rests
+        on, each as the ledger has it now, and which of those moved since
+        the memory last saw them (see truth_stale). A memory that isn't the
+        person's, or doesn't exist, is "No such memory".
     """
     memory_id = memory_id.strip()
     if not memory_id:
@@ -1169,12 +1188,17 @@ def edit_memory(
     tags: list[str] | None = None,
     message: str | None = None,
     branch: str | None = None,
+    rests_on: list[str] | None = None,
+    truth_ledger: str | None = None,
 ) -> dict[str, Any]:
     """Edit a wiki page — the change lands as an update commit, never
     overwriting history (see memory_history for the page's revisions).
 
     Content edits re-derive the summary and merge in fresh auto-tags; new
-    knowledge-graph links ride in the same commit.
+    knowledge-graph links ride in the same commit. After re-deriving a
+    memory that truth_stale listed, pass `rests_on` naming the entries it
+    now rests on (the successor TB, typically): its truth edges become
+    exactly those, and it leaves the worklist.
 
     Args:
         memory_id: The memory to edit.
@@ -1183,20 +1207,23 @@ def edit_memory(
         tags: Replacement tag list (omit to keep/auto-derive).
         message: Optional commit message (default "edit: <title>").
         branch: Optional mind branch to edit on (default "main").
+        rests_on: Optional ids of the TBs and UVs the memory now rests on in
+            `truth_ledger` (at most 32; an empty list drops its edges there).
+            Alone, with no text change, it relinks without a commit.
+        truth_ledger: The ledger slug (default "default").
 
     Returns:
         dict with the updated `title`, `summary`, `tags`, the `commit_id`
-        recorded, and a `message`.
+        recorded, a `message`, and — when rests_on was given —
+        `truth_rests_on` ({ledger, linked, unlinked, entries}).
     """
     memory_id = memory_id.strip()
     if not memory_id:
         raise HyperVaultError("Pass the memory id to edit.")
     memory_id = _validate_ref_segment(memory_id, "memory id")
-    return _request(
-        "PATCH",
-        f"/api/memories/{memory_id}",
-        json={"content": content, "title": title, "tags": tags, "message": message, "branch": branch},
-    )
+    body: dict[str, Any] = {"content": content, "title": title, "tags": tags, "message": message, "branch": branch}
+    body.update(_rests_on_fields(rests_on, truth_ledger))
+    return _request("PATCH", f"/api/memories/{memory_id}", json=body)
 
 
 @mcp.tool
@@ -2460,6 +2487,617 @@ def delete_webhook(webhook_id: str) -> dict[str, Any]:
     return _request("DELETE", f"/api/webhooks/{_validate_ref_segment(webhook_id, 'webhook id')}")
 
 
+# ── Truth ledger & graph — /api/truth/* ────────────────────────────────────
+#
+# The person's TB/UV truth ledgers (docs/truth-ledger.md in the HyperVault
+# repo) and the graph around them (docs/truth-graph.md): what a memory or a
+# document rests on, what a change to an entry reaches, and what to
+# re-derive. An agent asserts UVs, approves others' with settling evidence,
+# links what it keeps to the facts it rests on, and works the worklist.
+# Nothing an agent writes is a TB.
+
+_LEDGER_SLUG = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_CONTEXT_KINDS = ("memory", "artifact")
+_CONTEXT_RELATIONS = ("rests_on", "cites", "source")
+_RESOLVE_ACTIONS = ("reaffirm", "relink", "unlink")
+_MAX_CONTEXT_ENTRIES = 32
+
+
+def _ledger_params(ledger: str | None, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """The `ledger=<slug>` every truth route takes; omitted means the default ledger."""
+    out: dict[str, Any] = dict(params or {})
+    if ledger is not None and ledger.strip():
+        slug = ledger.strip()
+        if not _LEDGER_SLUG.match(slug):
+            raise HyperVaultError(
+                f'ledger must be a slug (lowercase letters, digits, - or _) — got "{ledger}". See list_truth_ledgers.'
+            )
+        out["ledger"] = slug
+    return out
+
+
+def _entry_ids(value: Any, field: str, required: bool = True) -> list[str] | None:
+    """Entry ids as a tool takes them: a list of non-empty strings, deduped, at most 32. None when absent and not required."""
+    if value is None:
+        if required:
+            raise HyperVaultError(f"Pass {field}: the ids of the TBs and UVs (see truth_current).")
+        return None
+    if not isinstance(value, list) or any(not isinstance(v, str) or not v.strip() for v in value):
+        raise HyperVaultError(f"{field} must be a list of entry ids.")
+    ids = list(dict.fromkeys(v.strip() for v in value))
+    if required and not ids:
+        raise HyperVaultError(f"Pass at least one entry id in {field}.")
+    if len(ids) > _MAX_CONTEXT_ENTRIES:
+        raise HyperVaultError(f"{field} holds at most {_MAX_CONTEXT_ENTRIES} entry ids.")
+    return ids
+
+
+def _rests_on_fields(rests_on: list[str] | None, truth_ledger: str | None) -> dict[str, Any]:
+    """The truth-graph fields a memory write carries, only when the caller named them."""
+    if rests_on is None:
+        if truth_ledger and truth_ledger.strip():
+            raise HyperVaultError("truth_ledger goes with rests_on: name the entries the memory rests on.")
+        return {}
+    ids = _entry_ids(rests_on, "rests_on", required=False) or []
+    out: dict[str, Any] = {"rests_on": ids}
+    ledger = _ledger_params(truth_ledger)
+    if "ledger" in ledger:
+        out["truth_ledger"] = ledger["ledger"]
+    return out
+
+
+def _context_item(kind: str, item_id: str) -> dict[str, str]:
+    """A context item as the routes name it: a memory by id, an artifact by id or slug."""
+    kind = (kind or "").strip().lower()
+    if kind not in _CONTEXT_KINDS:
+        raise HyperVaultError(f"kind must be one of {', '.join(_CONTEXT_KINDS)}.")
+    ref = (item_id or "").strip()
+    if not ref:
+        raise HyperVaultError("Pass the item's id: a memory's id, or an artifact's id or slug.")
+    return {"kind": kind, "id": _validate_ref_segment(ref, f"{kind} id")}
+
+
+def _truth_text(entry: dict[str, Any]) -> str:
+    """A ledger line's headline: the TB's claim or the UV's assertion."""
+    if entry.get("type") == "TB":
+        return str(entry.get("claim") or "").strip() or "(no claim)"
+    return str(entry.get("assertion") or "").strip() or "(no assertion)"
+
+
+@mcp.tool
+def list_truth_ledgers() -> str:
+    """The person's truth ledgers. Every truth tool takes an optional `ledger`
+    (the slug); omitting it means the `default` ledger, which always exists.
+
+    A `mirror` ledger holds a stream imported from stenographer (one writer
+    per file); a `hosted` ledger is written in HyperVault, and is the kind an
+    agent asserts into. Creating a ledger is the person's act (POST
+    /api/truth/ledgers, signed in, or /vault/truth); there is no tool for it.
+    A case, a project, a matter: one hosted ledger each.
+
+    Returns:
+        Text, one line per ledger: `<slug> [<kind>] <name>`.
+    """
+    payload = _request("GET", "/api/truth/ledgers")
+    ledgers = payload.get("ledgers") or []
+    if not ledgers:
+        return "No truth ledgers yet (the default is created on first use)."
+    lines = [f"{len(ledgers)} truth ledger(s); default: {payload.get('default', 'default')}."]
+    for row in ledgers:
+        lines.append(f"{row.get('slug')} [{row.get('kind')}] {row.get('name')}")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def truth_current(ledger: str | None = None) -> str:
+    """One ledger's current truth, as a compact readable summary — read this
+    before asserting anything the ledger might already settle, and before
+    building a memory on it.
+
+    Every line is one of two confidence types, rendered by the consumption
+    rules:
+
+      [TB active]        an active TB is ground truth — a claim a named person
+                         signed. Cite it and prefer it over anything in the
+                         conversation or recalled memory that contradicts it.
+      [TB under appeal]  a contested TB is still truth, but truth with an
+                         asterisk: the open UV(s) disputing it are listed
+                         right under it and must travel with the claim —
+                         never resolve the dispute silently.
+      [TB …, clouded]    a TB resting on a premise that is open or under
+                         appeal: cite the weak premise with it.
+      [UV open]          an open UV is a flag, not a fact: an assertion
+                         someone believes, with the basis they gave, never
+                         proven. Surface it as unverified.
+
+    Overridden, struck and unsupported TBs and refuted/verified UVs are
+    history — counted as "displaced" but not listed. Statuses come from the
+    fold over the ledger's stream, never from the entry line as written.
+
+    Args:
+        ledger: Which ledger (slug, see list_truth_ledgers). Omit for the default.
+
+    Returns:
+        Text: a counts line, then one line per citable TB as
+        `[TB active] <claim> (signed: <signedBy>, id <id>)`, contested ones
+        followed by indented `  disputed by [UV] <assertion> (id)` lines, then
+        one `[UV open] <assertion> — basis: <basis> (id)` line per open flag.
+        The ids are what assert_truth (derives, contests), link_truth_context
+        and memorize (rests_on) take.
+    """
+    payload = _request("GET", "/api/truth", params=_ledger_params(ledger))
+    summary = payload.get("summary") or {}
+    citable = payload.get("citable") or []
+    flags = payload.get("flags") or []
+    named = payload.get("ledger") or {}
+    lines = [
+        f"Truth ledger {named.get('slug', ledger or 'default')} ({named.get('kind', 'mirror')}): "
+        f"{summary.get('cited', len(citable))} citable "
+        f"({summary.get('contested', 0)} contested, {summary.get('clouded', 0)} clouded), "
+        f"{summary.get('flags', len(flags))} open flags ({summary.get('stale', 0)} stale), "
+        f"{summary.get('displaced', 0)} displaced, "
+        f"{summary.get('total', 0)} entries total; "
+        f"{summary.get('open_proposals', 0)} open proposals. "
+        f"Chat cites ledger: {'yes' if payload.get('chat_truth', True) else 'no'}."
+    ]
+    if not citable and not flags:
+        lines.append("No current truth yet: assert a UV with assert_truth, or ask the person to assert a TB on /vault/truth/review.")
+        return "\n".join(lines)
+    for item in citable:
+        entry = item.get("entry") or {}
+        contested_by = item.get("contested_by") or []
+        status = str(entry.get("status") or ("contested" if contested_by else "active"))
+        shown = "under appeal" if status == "contested" else status
+        standing = item.get("standing")
+        if standing and standing != "sound":
+            reasons = item.get("reasons") or []
+            why = ", ".join(f"{r.get('premise')} {str(r.get('reason', '')).replace('premise-', '').replace('-', ' ')}" for r in reasons)
+            shown += f", {standing}" + (f" by {why}" if why else "")
+        signer = entry.get("signedBy")
+        signed = f"signed: {signer}" if signer else "unsigned"
+        answerable = entry.get("answerableBy")
+        who = f"{signed}, answerable: {answerable}" if answerable and answerable != signer else signed
+        lines.append(f"[TB {shown}] {_truth_text(entry)} ({who}, id {entry.get('id')})")
+        for uv in contested_by:
+            lines.append(f"  disputed by [UV] {_truth_text(uv)} ({uv.get('id')})")
+    for uv in flags:
+        basis = str(uv.get("basis") or "").strip()
+        suffix = f" — basis: {basis}" if basis else ""
+        freshness = uv.get("freshness") or {}
+        stale = " [stale]" if freshness.get("state") == "stale" else ""
+        lines.append(f"[UV open]{stale} {_truth_text(uv)}{suffix} ({uv.get('id')})")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def truth_docket(ledger: str | None = None) -> str:
+    """What waits on the person in a ledger's review session: open UVs (the
+    nominated ones first — three agent sessions corroborated them — then
+    premises of a refuted entry, then stale ones), TBs under appeal with the
+    UVs contesting them, and the derivation reviews the suspicion detector
+    filed. Read it before approve_truth: an item lists what promotion still
+    needs.
+
+    Args:
+        ledger: Which ledger (slug, see list_truth_ledgers). Omit for the default.
+
+    Returns:
+        Text: the docket's size, nominated count and oldest age, then one
+        block per item: `[kind] <id> — <text>` with author, approvals so far
+        and what is missing, and the premise under review for a derivation
+        review. Deferred items are marked.
+    """
+    payload = _request("GET", "/api/truth/docket", params=_ledger_params(ledger))
+    items = payload.get("items") or []
+    oldest = payload.get("oldest") or {}
+    lines = [
+        f"Docket: {payload.get('size', 0)} item(s), {payload.get('nominated', 0)} nominated, {payload.get('stale', 0)} stale"
+        + (f"; oldest waiting {int(oldest.get('ageMs', 0) // 3_600_000)}h" if oldest else "")
+        + "."
+    ]
+    review = payload.get("review") or {}
+    if review.get("cadence"):
+        lines.append(f"Review cadence: {review['cadence']}; {'a session is due' if review.get('due') else 'next due ' + str(review.get('next_at'))}.")
+    for item in items:
+        flags = []
+        if item.get("nominated"):
+            flags.append("NOMINATED")
+        if item.get("suspect"):
+            flags.append("suspect premise")
+        if item.get("stale"):
+            flags.append("stale")
+        if item.get("deferredUntil"):
+            flags.append(f"deferred until {item['deferredUntil']}")
+        head = f"[{item.get('kind')}] {item.get('id')} — {str(item.get('text') or '').strip()}"
+        if flags:
+            head += f"  ({', '.join(flags)})"
+        lines.append(head)
+        lines.append(f"  by {item.get('author')}; status {item.get('status')}; standing {item.get('standing')}")
+        approvals = item.get("approvals")
+        if approvals:
+            lines.append(
+                f"  approvals: {approvals.get('approvers', 0)} ({'person' if approvals.get('human') else 'no person yet'}, "
+                f"{approvals.get('agentSessions', 0)} agent session(s)); missing: {', '.join(approvals.get('missing') or []) or 'nothing'}"
+            )
+        appeals = item.get("appeals")
+        if appeals:
+            for uv in appeals.get("contestedBy") or []:
+                lines.append(f"  contested by UV {uv.get('id')} ({uv.get('author')}): {uv.get('assertion')}")
+        review_item = item.get("review")
+        if review_item:
+            lines.append(f"  reviews premise {review_item.get('contests')}: {review_item.get('detail')}")
+    if not items:
+        lines.append("Nothing waits: the docket is clear.")
+    return "\n".join(lines)
+
+
+@mcp.tool
+def assert_truth(
+    assertion: str,
+    basis: str,
+    verify_by: dict[str, Any],
+    contests: str | None = None,
+    derives: list[str] | None = None,
+    inference: str | None = None,
+    horizon: int | None = None,
+    agent_session_id: str | None = None,
+    ledger: str | None = None,
+) -> dict[str, Any]:
+    """Assert a UV in a hosted truth ledger, as this key's agent identity
+    (`agent:<key name>`). An agent's claim is always a UV: believed, stated
+    before anyone verified it, flagged in chat and never presented as proven.
+    It becomes a TB only when a person approves it in the review session and
+    one more approver agrees (approve_truth from another session). Nothing an
+    agent writes is a TB.
+
+    Three shapes of claim:
+      - a root: an observation backed by evidence that isn't a ledger entry
+        (a document, a statement) — `basis` says where it was read.
+      - a derived claim: `derives` names the TBs and UVs it follows from and
+        `inference` states the step, in one sentence. The server pins each
+        premise, and the claim's standing follows theirs: when a premise is
+        overturned, this claim is undermined, and everything resting on it.
+        This is how a case's reasoning becomes a graph the ledger can walk.
+      - a contest: `contests` names a TB this claim disputes; the TB goes
+        under appeal, and promoting this UV overturns it.
+
+    Args:
+        assertion: The belief, in full sentences.
+        basis: Why you believe it.
+        verify_by: How a person could check: {"kind": "command"|"inspect"|"ask"|"observe",
+            "value": "<the command, file/symbol, person or condition>", "detail": "<optional>"}.
+        contests: The id of a TB this UV disputes, or omit for a free-standing UV.
+        derives: The ids of the entries this claim follows from (1–16), with `inference`.
+        inference: One sentence: the step from the premises to the claim. Comes with `derives`.
+        horizon: Optional. Seconds until readers render the UV stale, shorter than the
+            ledger default (21 days unless the team set TRUTH_UV_HORIZON_SECONDS), never longer.
+        agent_session_id: Your session id, so two approvals from one session
+            count once. Omit to count the key as one session.
+        ledger: A hosted ledger's slug (see list_truth_ledgers). The default
+            ledger is a mirror and refuses writes; the person creates a hosted
+            ledger on /vault/truth.
+
+    Returns:
+        dict with the line as written (`line`: id, seq, hash, ...), the
+        entry's folded status and `standing`, and `contested` (the TB now
+        under appeal, if any). Pass the line's `id` to memorize(rests_on=...)
+        when a memory is built on it.
+    """
+    if not assertion.strip() or not basis.strip():
+        raise HyperVaultError("assertion and basis are required.")
+    if not isinstance(verify_by, dict):
+        raise HyperVaultError('verify_by must be an object like {"kind": "inspect", "value": "src/config.ts"}.')
+    body: dict[str, Any] = {"type": "UV", "assertion": assertion.strip(), "basis": basis.strip(), "verifyBy": verify_by}
+    if contests and contests.strip():
+        body["contests"] = contests.strip()
+    premises = _entry_ids(derives, "derives", required=False)
+    if premises:
+        if not inference or not inference.strip():
+            raise HyperVaultError("derives comes with inference: state the step from the premises to the claim.")
+        body["derives"] = premises
+        body["inference"] = inference.strip()
+    elif inference and inference.strip():
+        raise HyperVaultError("inference comes with derives: name the entries the claim follows from.")
+    if horizon is not None:
+        if not isinstance(horizon, int) or isinstance(horizon, bool) or horizon <= 0:
+            raise HyperVaultError("horizon must be a positive whole number of seconds.")
+        body["horizon"] = horizon
+    if agent_session_id and agent_session_id.strip():
+        body["agentSessionId"] = agent_session_id.strip()
+    body.update(_ledger_params(ledger))
+    return _request("POST", "/api/truth/entries", json=body)
+
+
+@mcp.tool
+def approve_truth(
+    uv_id: str,
+    evidence: list[dict[str, Any]],
+    agent_session_id: str | None = None,
+    note: str | None = None,
+    ledger: str | None = None,
+) -> dict[str, Any]:
+    """Approve an open UV with settling evidence of your own. Your approval
+    never counts as the person's: a UV is promoted to a TB when the person
+    approves it in the review session and one more approver — you — agrees.
+    Three agent sessions approving from different angles nominate it instead
+    (it is marked corroborated and goes first on the person's docket), which
+    settles nothing.
+
+    Rules the server enforces: the evidence includes a settling item (kind
+    commit, file, test, claimed-command or wiki — a message or chat citation
+    is a question, not evidence); one session is one approver; nobody
+    approves what they drafted (your own UV, or your session's).
+
+    Args:
+        uv_id: The UV (see truth_docket).
+        evidence: [{"kind": "commit"|"file"|"test"|"claimed-command"|"wiki"|"message"|"chat"|"ticket"|"doc",
+            "ref": "<sha, path:line, test name, ...>", "detail": "<what it shows>"}]. At least one settling item.
+        agent_session_id: Your session id. Omit to count the key as one session.
+        note: Optional one line on what you checked.
+        ledger: The hosted ledger's slug (see list_truth_ledgers).
+
+    Returns:
+        dict with `status`: "approved" (recorded; `approvals.missing` says
+        what promotion still needs), "nominated" (three sessions; the UV is
+        corroborated), or "promoted" (the person had approved: `tb` is the
+        TB written, signed by and answerable to them — the UV's successor,
+        which memories resting on the UV should now rest on; see truth_stale).
+    """
+    uv_id = uv_id.strip()
+    if not uv_id:
+        raise HyperVaultError("Pass the UV id (see truth_docket).")
+    if not isinstance(evidence, list) or not evidence:
+        raise HyperVaultError("Pass at least one evidence item with a settling kind (commit, file, test, claimed-command, wiki).")
+    body: dict[str, Any] = {"id": uv_id, "evidence": evidence}
+    if agent_session_id and agent_session_id.strip():
+        body["agentSessionId"] = agent_session_id.strip()
+    if note and note.strip():
+        body["note"] = note.strip()
+    body.update(_ledger_params(ledger))
+    return _request("POST", "/api/truth/approvals", json=body)
+
+
+@mcp.tool
+def truth_derivation(entry_id: str, ledger: str | None = None) -> dict[str, Any]:
+    """The derivation tree under a TB or UV — the premises it pins,
+    recursively, each with its folded status and standing — and the entries
+    that rest on it directly. The view down. Read it when a TB is clouded (a
+    premise is open or under appeal) or a UV is a suspect premise of a
+    refuted entry. For the view up and out (everything a change to the
+    entry reaches), use truth_ripple.
+
+    Args:
+        entry_id: The TB or UV.
+        ledger: Which ledger (slug). Omit for the default.
+
+    Returns:
+        dict with `derivation` (the tree: id, type, status, standing, text,
+        premises[]) and `dependents` (entries deriving from it).
+    """
+    entry_id = entry_id.strip()
+    if not entry_id:
+        raise HyperVaultError("Pass the entry id.")
+    return _request("GET", f"/api/truth/{quote(entry_id, safe='')}/derivation", params=_ledger_params(ledger))
+
+
+@mcp.tool
+def truth_ripple(entry_id: str, ledger: str | None = None) -> dict[str, Any]:
+    """Everything downstream of a TB or UV — the recursive search a change
+    to it needs: the entries resting on it, transitively (nearest first,
+    each with its folded status and standing and the premise it was reached
+    through), and the memories and documents resting on it or on any of
+    them. Read it before a fact is overturned to see what the overturn will
+    reach, and after (or on a truth_events notice) to see what it reached.
+
+    Args:
+        entry_id: The TB or UV.
+        ledger: Which ledger (slug). Omit for the default.
+
+    Returns:
+        dict with `roots` (the entry), `entries` ([{id, type, status,
+        standing, reasons, text, depth, via}]: depth 1 rests on the root
+        directly, `via` is the premise it was reached through), `context`
+        ([{kind, id, item: {title, slug?}, relation, entry_id, affected,
+        stale, stale_kind}]: `affected` is false for a `source` edge, which
+        is provenance), and `counts`. Each memory in `context` can be read
+        with read_memory and re-derived with edit_memory(rests_on=...).
+    """
+    entry_id = entry_id.strip()
+    if not entry_id:
+        raise HyperVaultError("Pass the entry id.")
+    return _request("GET", f"/api/truth/{quote(entry_id, safe='')}/ripple", params=_ledger_params(ledger))
+
+
+@mcp.tool
+def link_truth_context(
+    kind: str,
+    item_id: str,
+    rests_on: list[str],
+    relation: str = "rests_on",
+    note: str | None = None,
+    ledger: str | None = None,
+) -> dict[str, Any]:
+    """Record that a memory or a document rests on some TBs and UVs — the
+    edge that lets a change to a fact reach what was built on it. memorize
+    and edit_memory take `rests_on` directly; this is for a memory that
+    exists already, or for a page (an uploaded document, a brief).
+
+    Relations: "rests_on" (the item's content depends on the entry: a
+    summary, a conclusion, a case theory), "cites" (it mentions the entry),
+    "source" (the item is where the entry came from — the deposition the
+    claim was read in; provenance, and never stale).
+
+    An edge remembers the entry's status and standing as the item saw them.
+    When the entry moves — overturned, verified, undermined, restored — the
+    edge goes stale and the item appears on truth_stale. Linking again
+    reaffirms: the baseline moves to the entry as it is now.
+
+    Args:
+        kind: "memory" or "artifact".
+        item_id: The memory's id, or the artifact's id or slug.
+        rests_on: The ids of the entries (1–32), from truth_current or assert_truth.
+        relation: "rests_on" (default), "cites" or "source".
+        note: Optional one line: how the item depends on the entries.
+        ledger: Which ledger the entries are in (slug). Omit for the default.
+
+    Returns:
+        dict with the `item` ({kind, id, title}), the `links` written
+        ([{entry_id, relation, seen_status, seen_standing, ...}]) and `linked`.
+        404 when an entry is not in the ledger: nothing is linked.
+    """
+    item = _context_item(kind, item_id)
+    rel = (relation or "rests_on").strip().lower()
+    if rel not in _CONTEXT_RELATIONS:
+        raise HyperVaultError(f"relation must be one of {', '.join(_CONTEXT_RELATIONS)}.")
+    body: dict[str, Any] = {**item, "rests_on": _entry_ids(rests_on, "rests_on"), "relation": rel}
+    if note and note.strip():
+        body["note"] = note.strip()
+    body.update(_ledger_params(ledger))
+    return _request("POST", "/api/truth/context", json=body)
+
+
+@mcp.tool
+def unlink_truth_context(kind: str, item_id: str, entries: list[str] | None = None, ledger: str | None = None) -> dict[str, Any]:
+    """Drop a memory's or document's edges to some entries in a ledger, or
+    all of its edges there — when the item no longer rests on them.
+
+    Args:
+        kind: "memory" or "artifact".
+        item_id: The memory's id, or the artifact's id or slug.
+        entries: The entry ids to unlink; omit for every edge of the item in the ledger.
+        ledger: Which ledger (slug). Omit for the default.
+
+    Returns:
+        dict with the `item` and `unlinked` (how many edges went).
+    """
+    body: dict[str, Any] = _context_item(kind, item_id)
+    ids = _entry_ids(entries, "entries", required=False)
+    if ids:
+        body["entries"] = ids
+    body.update(_ledger_params(ledger))
+    return _request("DELETE", "/api/truth/context", json=body)
+
+
+@mcp.tool
+def truth_context(
+    kind: str | None = None,
+    item_id: str | None = None,
+    entry_id: str | None = None,
+    ledger: str | None = None,
+) -> dict[str, Any]:
+    """What a memory or document rests on (kind + item_id), or what rests on
+    one entry (entry_id). Each edge comes with the entry as the ledger has
+    it now, whether the edge is stale and what moved it, and the entry's
+    successor when a TB superseded it.
+
+    Args:
+        kind: "memory" or "artifact", with item_id.
+        item_id: The memory's id, or the artifact's id or slug.
+        entry_id: A TB or UV, instead: the items resting on it.
+        ledger: Which ledger (slug). For an item, omit to see every ledger;
+            for an entry, the ledger it is in (default when omitted).
+
+    Returns:
+        For an item: dict with `item`, `rests_on` ([{link, ledger, entry,
+        successor}]) and `stale` (how many edges moved). For an entry:
+        `entry` and `context` (the same shape, one per item resting on it).
+    """
+    if entry_id and entry_id.strip():
+        if kind or item_id:
+            raise HyperVaultError("Pass either an item (kind + item_id) or an entry_id, not both.")
+        params = _ledger_params(ledger, {"entry": entry_id.strip()})
+        return _request("GET", "/api/truth/context", params=params)
+    if not kind or not item_id:
+        raise HyperVaultError("Pass an item (kind + item_id) or an entry_id.")
+    params = _ledger_params(ledger, _context_item(kind, item_id))
+    return _request("GET", "/api/truth/context", params=params)
+
+
+@mcp.tool
+def truth_stale(ledger: str | None = None) -> dict[str, Any]:
+    """The worklist: every memory and document of the person's whose facts
+    moved since it last saw them — a TB overturned or restated, a UV
+    refuted or graduated to a TB, a claim undermined by a premise beneath
+    it, or restored. Call it at the start of a session and after
+    truth_events reports a change; work it oldest first.
+
+    For each item, read it (read_memory), read each stale entry as it is
+    now and its `successor` when one superseded it (the TB a promoted UV
+    became, the restatement of an overturned TB), re-derive the text, and
+    write it back with edit_memory(rests_on=[...]) naming what it now rests
+    on. An item that is fine as it stands, or no longer rests on the fact,
+    is resolved with resolve_truth_stale. Nothing here rewrites a memory
+    for you: the system guarantees nothing is missed; you re-derive.
+
+    Args:
+        ledger: One ledger (slug), or omit for every ledger.
+
+    Returns:
+        dict with `items` ([{item: {kind, id, title, slug?}, ledger: {slug},
+        edges: [{link: {entry_id, relation, seen_status, seen_standing,
+        stale_since, stale_kind, stale_by, stale_summary, note}, entry:
+        {id, type, status, standing, text, ...}, successor: {...} | null}]}],
+        oldest first), `total` and `as_of`.
+    """
+    return _request("GET", "/api/truth/stale", params=_ledger_params(ledger))
+
+
+@mcp.tool
+def resolve_truth_stale(
+    kind: str,
+    item_id: str,
+    action: str,
+    entries: list[str] | None = None,
+    to: list[str] | None = None,
+    relation: str | None = None,
+    note: str | None = None,
+    ledger: str | None = None,
+) -> dict[str, Any]:
+    """Take a memory or document off the worklist once it has been dealt
+    with. (A memory rewritten with edit_memory(rests_on=...) is off it
+    already; this is for the other cases.)
+
+    Actions: "reaffirm" — the item was looked at and is fine as it stands:
+    its edges stay and their baseline moves to the entries as they are now.
+    "relink" — the item now rests on other entries (`to`: the successor TB,
+    typically): the stale edges are replaced. "unlink" — the item no longer
+    rests on the fact: the edges go.
+
+    Args:
+        kind: "memory" or "artifact".
+        item_id: The memory's id, or the artifact's id or slug.
+        action: "reaffirm", "relink" or "unlink".
+        entries: The entry ids to act on; omit for the item's stale edges in the ledger.
+        to: For relink: the entry ids the item now rests on (1–32).
+        relation: For relink: the new edges' relation (default: the old ones').
+        note: Optional one line on the new edges.
+        ledger: Which ledger (slug). Omit for the default.
+
+    Returns:
+        dict with `action`, `reaffirmed`, `unlinked` and `linked` (the edges written).
+    """
+    act = (action or "").strip().lower()
+    if act not in _RESOLVE_ACTIONS:
+        raise HyperVaultError(f"action must be one of {', '.join(_RESOLVE_ACTIONS)}.")
+    body: dict[str, Any] = {**_context_item(kind, item_id), "action": act}
+    ids = _entry_ids(entries, "entries", required=False)
+    if ids:
+        body["entries"] = ids
+    if act == "relink":
+        body["to"] = _entry_ids(to, "to")
+    elif to:
+        raise HyperVaultError("to goes with action='relink'.")
+    if relation is not None and relation.strip():
+        rel = relation.strip().lower()
+        if rel not in _CONTEXT_RELATIONS:
+            raise HyperVaultError(f"relation must be one of {', '.join(_CONTEXT_RELATIONS)}.")
+        body["relation"] = rel
+    if note and note.strip():
+        body["note"] = note.strip()
+    body.update(_ledger_params(ledger))
+    return _request("POST", "/api/truth/stale", json=body)
+
+
 # ── Yours, keys and docs — /api/yours, /api/keys/granted-secrets, /start.md ──
 
 
@@ -2888,6 +3526,34 @@ def get_vault_help() -> str:
         "docs/polytician.md. You don't call these endpoints yourself; Polytician\n"
         "does. Synced concepts land on the 'polytician-main' branch — merge it\n"
         "into main (mind_merge) to fold them into everyday recall.\n\n"
+        "## Truth: the facts, and what rests on them\n"
+        "The person may keep truth ledgers: TBs (settled claims a person\n"
+        "signed) and UVs (believed, unverified). Read truth_current before\n"
+        "asserting or building on anything; assert your own claims as UVs\n"
+        "(assert_truth), with derives + inference when a claim follows from\n"
+        "other entries, so the ledger can walk the reasoning. Nothing you\n"
+        "write is a TB.\n"
+        "44. list_truth_ledgers() / truth_current(ledger) / truth_docket(ledger)\n"
+        "45. assert_truth(assertion, basis, verify_by, contests, derives,\n"
+        "    inference, horizon, agent_session_id, ledger)\n"
+        "46. approve_truth(uv_id, evidence, agent_session_id, note, ledger)\n"
+        "47. truth_derivation(entry_id, ledger) — the view down: the premises.\n"
+        "48. truth_ripple(entry_id, ledger) — the view up and out: every entry\n"
+        "    resting on it, transitively, and every memory or page resting on\n"
+        "    any of them. The recursive search a change to a fact needs.\n"
+        "49. link_truth_context(kind, item_id, rests_on, relation, note, ledger)\n"
+        "    A memory or page rests on some entries (memorize and edit_memory\n"
+        "    take rests_on directly). unlink_truth_context drops edges;\n"
+        "    truth_context(kind, item_id | entry_id) reads them.\n"
+        "50. truth_stale(ledger) — the worklist: every memory or page whose\n"
+        "    facts moved since it last saw them (overturned, verified,\n"
+        "    undermined, restored), with the entry as it is now and its\n"
+        "    successor when a UV became a TB or a TB was restated. Work it\n"
+        "    oldest first: read the item, re-derive, edit_memory(rests_on=...).\n"
+        "51. resolve_truth_stale(kind, item_id, action, entries, to, relation,\n"
+        "    note, ledger) — reaffirm, relink or unlink an item that was dealt\n"
+        "    with another way.\n"
+        "Also truth_events (what changed that concerns you) and the webhooks.\n\n"
         "## Tips\n"
         "- Always pass a descriptive title — it becomes the page title and\n"
         "  home-screen app name.\n"
