@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from unittest.mock import MagicMock
+
+from fastmcp import Client
 
 from hypervault_mcp import server
 
@@ -133,6 +136,56 @@ class TestVaultHelpResource:
         numbered = text.index("## Tools")
         for name in ("yours(query, kind, limit)", "read_memory(memory_id, branch=None)", "my_keys()"):
             assert 0 <= text.index(name) < numbered
+
+
+class TestArtifactSize:
+    """A text artifact can be 10 MB, but a tool call carries about 4 MB."""
+
+    @staticmethod
+    def described(name: str) -> str:
+        """What a client is shown about a tool: its description and its arguments'."""
+
+        async def list_tools():
+            async with Client(server.mcp) as client:
+                return {tool.name: tool for tool in await client.list_tools()}
+
+        tool = asyncio.run(list_tools())[name]
+        schema = getattr(tool, "input_schema", None) or tool.inputSchema
+        args = (p.get("description", "") for p in schema.get("properties", {}).values())
+        return flat(" ".join([tool.description or "", *args]))
+
+    def test_the_help_states_the_10_mb_limit_and_the_tool_call_cap(self):
+        text = flat(server.get_vault_help())
+        assert "An artifact can be up to 10 MB (inline assets count)" in text
+        assert "one tool call carries at most about 4 MB" in text
+        assert "staged upload" in text
+        assert 'content_omitted: "too_large"' in text
+        assert "under 1 MB" not in text
+
+    def test_saving_says_10_mb_and_why_a_call_stops_near_4_mb(self):
+        text = self.described("save_to_hypervault")
+        assert "up to 10 MB" in text
+        assert "a request body over 4.5 MB is refused (HTTP 413)" in text
+        assert "about 4 MB is the most one call can carry" in text
+        assert "/api/artifacts/content-upload-url" in text
+        assert "content_upload" in text
+
+    def test_writing_says_10_mb_and_how_a_large_head_is_left_out(self):
+        text = self.described("write_artifact")
+        assert "max 10 MB" in text
+        assert "max 1 MB" not in text
+        assert '`content_omitted` is "too_large"' in text
+        assert "read_artifact(ref, version=base_version_id)" in text
+
+    def test_reading_and_history_say_what_a_large_version_does(self):
+        assert "bigger than about 4 MB can only be read this way through a locally run server" in self.described("read_artifact")
+        history = self.described("artifact_history")
+        assert 'comes without it (content null, `content_omitted: "too_large"`)' in history
+        assert "A version over 1 MB" in history
+
+    def test_group_limits_are_unchanged(self):
+        assert (server.GROUP_MAX_FILES, server.GROUP_MAX_FILE_BYTES, server.GROUP_MAX_TOTAL_BYTES) == (50, 256_000, 1_000_000)
+        assert "at most 50 files, 256 KB" in flat(server.get_vault_help())
 
 
 class TestInstructions:
