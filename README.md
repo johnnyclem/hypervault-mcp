@@ -55,7 +55,7 @@ Authentication differs by transport — see [Auth & rate limits](#auth--rate-lim
 
 | Tool | What it does |
 | --- | --- |
-| `save_to_hypervault(content, title, type, tags, connect_to, make_pwa, source_prompt, visibility, mutable)` | Saves HTML or React/JSX and returns a permanent, installable URL. JSX is auto-detected and wrapped server-side. `connect_to` links the new artifact to existing ones (graph view edges); similar items are auto-connected too. Pass `source_prompt` to bake the originating prompt into the page as `<meta name="hypervault-source-prompt">` so agents can iterate later. Re-saving identical content returns the existing URL (`duplicate: true`) instead of creating a copy. Pass `mutable=True` for a **living document** you can rewrite in place (see below). |
+| `save_to_hypervault(content, title, type, tags, connect_to, make_pwa, source_prompt, visibility, mutable)` | Saves HTML or React/JSX and returns a permanent, installable URL. JSX is auto-detected and wrapped server-side. `connect_to` links the new artifact to existing ones (graph view edges); similar items are auto-connected too. Pass `source_prompt` to bake the originating prompt into the page as `<meta name="hypervault-source-prompt">` so agents can iterate later. Re-saving identical content returns the existing URL (`duplicate: true`) instead of creating a copy. Pass `mutable=True` for a **living document** you can rewrite in place (see below). An artifact can be up to 10 MB, but one call carries about 4 MB at most (see [How big an artifact can be](#how-big-an-artifact-can-be)). |
 | `claim_vanity_subdomain(desired_name, base_domain="vault.cool")` | Claims `name.vault.cool` for the user, effective immediately. Pro accounts can hold up to 10 subdomains; the full vault lives on every one. |
 | `connect_vault_items(source, target)` | Connects two existing artifacts (bidirectional, drawn in graph view). |
 | `list_my_vault_items()` | Lists everything already in the vault. |
@@ -215,6 +215,35 @@ with `base_version_id` set to the current head (writing it "based on" the old
 version itself is a no-op rebase, and the API says so).
 The write tools are owner-scoped (the API key resolves to its owner), so a
 mutable artifact is read and written privately even when the page is public.
+
+### How big an artifact can be
+
+HyperVault keeps a text artifact (an HTML page, a JSX component, a note) of up
+to **10 MB** of UTF-8, inline assets included (it was 1 MB). What gets through
+a tool is less:
+
+- `save_to_hypervault` and `write_artifact` send the content inline in one
+  request, and the platform refuses a request body over about 4.5 MB (an HTTP
+  413) before HyperVault sees it, so about 4 MB is the most one call can save.
+  The hosted server is a serverless function too, so the tool call itself is
+  capped the same way. In practice a page written in one call is far smaller:
+  a model rarely produces more than a few hundred KB at once.
+- A bigger page goes through the REST API's staged upload, which these tools
+  do not use: `POST /api/artifacts/content-upload-url` with `{ "size": <UTF-8
+  bytes> }` answers `{ path, signed_url, content_type, max_bytes }`; PUT the
+  UTF-8 bytes to `signed_url` with that `Content-Type`; then send
+  `"content_upload": path` in place of `content` to `POST /api/save`,
+  `POST /api/keep` or `PUT /api/artifacts/{slug}/content`. `GET /api` (with
+  your key) describes it.
+- Replies leave out artifact content over 1 MB: a write conflict's
+  `head_content`/`base_content` and `artifact_history(full=True)` set it to
+  `null` with `content_omitted: "too_large"`. `read_artifact` reads it, and
+  through the hosted server that works up to about 4 MB (a locally run server
+  has no such cap).
+- A write over 1 MB can be refused with a 507 while HyperVault's storage is
+  nearly full; smaller writes still work.
+
+Artifact groups keep their own limits (below), and they did not change.
 
 ### Artifact groups (multi-file projects)
 

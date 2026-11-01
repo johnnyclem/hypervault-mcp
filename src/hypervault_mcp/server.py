@@ -53,8 +53,9 @@ SOURCE_PROMPT_META_NAME = "hypervault-source-prompt"
 
 # Artifact groups: multi-file containers (HTML/CSS/JS/JSX) that route through
 # a root index.html, previewed/run in a JSFiddle-style container at
-# https://hypervault.store/g/{slug}. Limits mirror the ~1 MB single-artifact
-# guidance in save_to_hypervault's docs.
+# https://hypervault.store/g/{slug}. These limits are the group's own,
+# checked here before any network call; they did not change when a single
+# text artifact went from 1 MB to 10 MB.
 GROUP_INDEX_PATH = "index.html"
 GROUP_ALLOWED_EXTENSIONS = (".html", ".css", ".js", ".jsx")
 GROUP_MAX_FILES = 50
@@ -481,8 +482,21 @@ def save_to_hypervault(
     React/JSX content is detected automatically and wrapped into a working
     standalone page — you can pass a bare component and it will just work.
 
+    Size: HyperVault keeps a text artifact of up to 10 MB (UTF-8, inline
+    assets count), but this tool sends the content inline in one request,
+    and a request body over 4.5 MB is refused (HTTP 413) before HyperVault
+    sees it, so about 4 MB is the most one call can carry. Through the
+    hosted server the tool call itself is
+    capped the same way, since that server is a serverless function too. A
+    bigger page has to go through the REST API's staged upload (POST
+    /api/artifacts/content-upload-url, then `content_upload` in place of
+    `content`; GET /api describes it). In practice a page written in one
+    tool call is far smaller: a model rarely produces more than a few
+    hundred KB at once.
+
     Args:
-        content: The full HTML document or React/JSX source to save.
+        content: The full HTML document or React/JSX source to save (see
+            Size above).
         title: Human-friendly title shown in the user's vault.
         type: Content hint: "html", "jsx", "report", "game", etc.
         tags: Optional tags for organizing the vault. Tags also power
@@ -546,6 +560,11 @@ def read_artifact(ref: str, version: str | None = None) -> dict[str, Any]:
     wrapped page chrome. Pair it with write_artifact to make an edit: read,
     modify the returned content, then write it back.
 
+    A page can be up to 10 MB. HyperVault sends a large one whole, but the
+    hosted server answers a tool call in one reply of at most about 4.5 MB,
+    so a page bigger than about 4 MB can only be read this way through a
+    locally run server.
+
     Args:
         ref: The artifact's slug (e.g. "my-game-x7k2p9") or full URL
             (https://hypervault.store/a/my-game-x7k2p9, vanity domains work
@@ -604,10 +623,17 @@ def write_artifact(
     because a whole-document write from a stale read would silently drop every
     commit made since. Read the artifact first and pass its head_version_id.
 
+    A refusal carries the head's source (`head_content`) and your base's
+    (`base_content`) to merge against, except a source over 1 MB: that field
+    is null, `content_omitted` is "too_large" and `error` says so. Read the
+    head with read_artifact(ref), and your base with
+    read_artifact(ref, version=base_version_id).
+
     Args:
         ref: The artifact's slug or full URL.
         content: The full new HTML or React/JSX source (replaces the current
-            content; max 1 MB).
+            content; max 10 MB, but this tool sends it inline, so at most
+            about 4 MB gets through: see save_to_hypervault's Size).
         title: Optional new title (omit to keep the current one).
         message: Optional commit message describing the change (default
             "edit"). It shows up in artifact_history.
@@ -645,7 +671,8 @@ def write_artifact(
         "precondition_required", ...), `error`, `base_version_id`, the current
         `head`, `head_content` (the head's source) and `base_content` (your
         base's source, when known) — no write happened. Merge your change onto
-        `head_content` and write again with base_version_id = head.id.
+        `head_content` and write again with base_version_id = head.id
+        (see above for a source over 1 MB).
     """
     slug = _artifact_slug(ref)
     if not content or not content.strip():
@@ -681,7 +708,12 @@ def artifact_history(ref: str, full: bool = False, limit: int = 50) -> dict[str,
 
     Args:
         ref: The artifact's slug or full URL.
-        full: When true, include each version's full stored content.
+        full: When true, include each version's full stored content. A
+            version over 1 MB (or past the listing's read budget) comes
+            without it (content null, `content_omitted: "too_large"`); read
+            it with read_artifact(ref, version=<its id>). Through the hosted
+            server the whole reply must stay under about 4.5 MB, so ask for
+            fewer versions (`limit`) when they are large.
         limit: Max versions to return (default 50, max 200).
 
     Returns:
@@ -3557,7 +3589,12 @@ def get_vault_help() -> str:
         "## Tips\n"
         "- Always pass a descriptive title — it becomes the page title and\n"
         "  home-screen app name.\n"
-        "- Keep artifacts under 1 MB (inline assets count).\n"
+        "- An artifact can be up to 10 MB (inline assets count), but one tool\n"
+        "  call carries at most about 4 MB, so keep what you save in a call\n"
+        "  well under that. Bigger pages need the REST API's staged upload.\n"
+        "- Replies leave out artifact content over 1 MB (content_omitted:\n"
+        "  \"too_large\"); read_artifact reads it (through the hosted server,\n"
+        "  up to about 4 MB).\n"
         "- On errors, the message explains exactly what to fix; relay it to\n"
         "  the user when action is needed (e.g. creating an API key).\n"
     )
